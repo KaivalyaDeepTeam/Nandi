@@ -2,8 +2,12 @@ numpy
 pandas
 scikit-learn
 xgboost
-tensorflow
-tensorflow-metal  # Apple Silicon GPU acceleration (M1/M2/M3)
+torch
 ta
 joblib
 yfinance
+scipy
+hmmlearn
+feedparser
+requests
+transformers

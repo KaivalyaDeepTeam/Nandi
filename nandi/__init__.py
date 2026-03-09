@@ -1,10 +1,8 @@
 """
-Nandi - The Conscious Trading Agent
+Nandi V2 — Multi-Asset Multi-Strategy Portfolio Trading System.
 
-A reinforcement learning forex trading system using a novel
-Multi-Scale Fractal Attention Network (MSFAN) architecture.
-
-Named after Nandi, the bull of wisdom and patience.
+A reinforcement learning forex trading system using MSFAN architecture,
+extended to 8 pairs with portfolio-level risk management.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

@@ -1,14 +1,14 @@
 """
-Run Nandi live — makes trading decisions via MT5.
+Run Nandi V2 live — multi-pair portfolio trading via MT5.
 
-Nandi continuously learns from its own trades:
-- Stores every trade outcome in a replay buffer
-- Periodically fine-tunes on real experience (online learning)
-- Upweights learning from losing trades (learn from mistakes)
+Uses TradingOrchestrator to wire: data -> features -> regime -> alphas -> optimize -> risk.
+Synchronizes positions with MT5 via file bridge.
 
 Usage:
     python run_nandi.py
-    python run_nandi.py --paper  (paper trading, no real execution)
+    python run_nandi.py --paper
+    python run_nandi.py --timeframe M5 --paper
+    python run_nandi.py --pairs eurusd gbpusd --interval 300
 """
 
 import argparse
@@ -21,7 +21,8 @@ import json
 from datetime import datetime
 
 import numpy as np
-import tensorflow as tf
+import torch
+import joblib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,9 +31,16 @@ logging.basicConfig(
 logger = logging.getLogger("nandi")
 
 np.random.seed(42)
-tf.random.set_seed(42)
+torch.manual_seed(42)
 
 RUNNING = True
+
+# Polling intervals by timeframe
+POLL_INTERVALS = {
+    "D1": 300,   # 5 minutes
+    "M5": 30,    # 30 seconds (check all 8 pairs, take best setups)
+    "M1": 5,     # 5 seconds
+}
 
 
 def signal_handler(sig, frame):
@@ -45,308 +53,328 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-class ExperienceReplay:
-    """Stores real trade experiences for online learning.
-
-    Nandi learns from its actual trades, with priority on mistakes.
-    """
-
-    def __init__(self, capacity=1000, save_path="data/nandi/experience.json"):
-        self.capacity = capacity
-        self.save_path = save_path
-        self.buffer = []
-        self._load()
-
-    def add(self, market_state, position_info, action, reward, next_market_state,
-            next_position_info, done, metadata=None):
-        """Store a real trade experience."""
-        entry = {
-            "market_state": market_state.tolist() if hasattr(market_state, 'tolist') else market_state,
-            "position_info": position_info.tolist() if hasattr(position_info, 'tolist') else position_info,
-            "action": float(action),
-            "reward": float(reward),
-            "done": bool(done),
-            "timestamp": datetime.now().isoformat(),
-            "metadata": metadata or {},
-        }
-
-        # Priority: losing trades get stored with higher weight
-        if reward < 0:
-            entry["priority"] = 2.0  # Mistakes are 2x more important
-        else:
-            entry["priority"] = 1.0
-
-        self.buffer.append(entry)
-        if len(self.buffer) > self.capacity:
-            self.buffer.pop(0)
-
-        self._save()
-
-    def sample(self, batch_size=32):
-        """Priority-weighted sampling — mistakes are sampled more often."""
-        if len(self.buffer) < batch_size:
-            return None
-
-        priorities = np.array([e["priority"] for e in self.buffer])
-        probs = priorities / priorities.sum()
-
-        indices = np.random.choice(len(self.buffer), size=batch_size, p=probs)
-        return [self.buffer[i] for i in indices]
-
-    def stats(self):
-        if not self.buffer:
-            return "No experiences yet"
-        rewards = [e["reward"] for e in self.buffer]
-        losses = [r for r in rewards if r < 0]
-        wins = [r for r in rewards if r > 0]
-        return (
-            f"Experiences: {len(self.buffer)} | "
-            f"Wins: {len(wins)} | Losses: {len(losses)} | "
-            f"Avg reward: {np.mean(rewards):.4f}"
-        )
-
-    def _save(self):
-        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        # Save only metadata (not full market states) to keep file small
-        save_data = []
-        for e in self.buffer[-500:]:  # Keep last 500 for file
-            save_data.append({
-                "action": e["action"],
-                "reward": e["reward"],
-                "priority": e["priority"],
-                "timestamp": e["timestamp"],
-                "metadata": e["metadata"],
-            })
-        with open(self.save_path, "w") as f:
-            json.dump(save_data, f)
-
-    def _load(self):
-        if os.path.exists(self.save_path):
-            try:
-                with open(self.save_path, "r") as f:
-                    self.buffer = json.load(f)
-                logger.info(f"Loaded {len(self.buffer)} experiences from {self.save_path}")
-            except Exception:
-                self.buffer = []
-
-
-def online_learn(agent, experience_buffer, optimizer, n_steps=5):
-    """Fine-tune agent on real trade experiences.
-
-    This is how Nandi keeps learning and improves from mistakes.
-    """
-    batch = experience_buffer.sample(batch_size=32)
-    if batch is None:
-        return
-
-    logger.info(f"Online learning from {len(batch)} real experiences...")
-
-    for _ in range(n_steps):
-        # Simple policy gradient update on real experience
-        # We treat stored reward as the advantage signal
-        rewards = np.array([e["reward"] for e in batch], dtype=np.float32)
-        actions = np.array([e["action"] for e in batch], dtype=np.float32).reshape(-1, 1)
-        priorities = np.array([e["priority"] for e in batch], dtype=np.float32)
-
-        # Weight by priority (mistakes weighted more)
-        weights = priorities / priorities.mean()
-
-        # This is a simplified online update — just nudges the policy
-        # based on which actions got good/bad rewards
-        with tf.GradientTape() as tape:
-            # We don't have full states in the file replay,
-            # so this only runs when we have in-memory experiences
-            pass  # Full online RL would go here
-
-    logger.info(f"Online learning step complete | {experience_buffer.stats()}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Run Nandi Live Trading Agent")
+    parser = argparse.ArgumentParser(description="Run Nandi V2 Live Trading")
     parser.add_argument("--paper", action="store_true", help="Paper trading mode")
-    parser.add_argument("--interval", type=int, default=300, help="Check interval (seconds)")
+    parser.add_argument("--interval", type=int, default=None,
+                        help="Check interval in seconds (auto-set by timeframe if omitted)")
+    parser.add_argument("--timeframe", type=str, default="D1",
+                        choices=["D1", "M5"],
+                        help="Trading timeframe (default: D1)")
+    parser.add_argument("--pairs", nargs="+", default=None)
     args = parser.parse_args()
 
-    from nandi.config import MODEL_DIR, LOOKBACK_WINDOW, LIVE_CONFIG, MT5_FILES_DIR
-    from nandi.data import download_forex_data, compute_features
-    from nandi.model import NandiAgent
+    # Auto-set polling interval based on timeframe
+    if args.interval is None:
+        args.interval = POLL_INTERVALS.get(args.timeframe, 300)
 
-    # Load agent
-    import joblib
-    scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
-    if not os.path.exists(scaler_path):
-        logger.error("No trained model found. Run train_nandi.py first.")
+    from nandi.config import (
+        MODEL_DIR, LIVE_CONFIG, MT5_FILES_DIR, PAIRS,
+        TIMEFRAME_PROFILES, NEWS_CONFIG,
+    )
+    from nandi.data.manager import download_forex_data
+    from nandi.data.features import compute_features
+    from nandi.data.advanced_features import compute_advanced_features
+    from nandi.models.agent import NandiAgent
+    from nandi.orchestrator import TradingOrchestrator
+    from nandi.regime.hmm_detector import HMMRegimeDetector
+    from nandi.risk.tail_hedge import TailRiskHedger
+    from nandi.backtest.ood_detector import OODDetector
+
+    profile = TIMEFRAME_PROFILES.get(args.timeframe, TIMEFRAME_PROFILES["D1"])
+    lookback = profile["lookback_bars"]
+
+    # Load trained pairs
+    trained_pairs_path = os.path.join(MODEL_DIR, "trained_pairs.pkl")
+    if os.path.exists(trained_pairs_path):
+        available_pairs = joblib.load(trained_pairs_path)
+    else:
+        available_pairs = PAIRS
+
+    pairs = args.pairs or available_pairs
+
+    # Load training metadata for encoder type
+    meta_path = os.path.join(MODEL_DIR, "training_meta.pkl")
+    encoder_type = "msfan"
+    if os.path.exists(meta_path):
+        meta = joblib.load(meta_path)
+        encoder_type = meta.get("encoder", "msfan")
+
+    # Load agents and scalers
+    agents = {}
+    scalers = {}
+    feature_names_map = {}
+
+    for pair in pairs:
+        pair_dir = os.path.join(MODEL_DIR, pair)
+        agent_path = os.path.join(pair_dir, "agent.pt")
+        scaler_path = os.path.join(pair_dir, "scaler.pkl")
+        fn_path = os.path.join(pair_dir, "feature_names.pkl")
+
+        if not all(os.path.exists(p) for p in [agent_path, scaler_path, fn_path]):
+            logger.warning(f"Missing model files for {pair}, skipping")
+            continue
+
+        # Check per-pair meta for encoder type override
+        pair_meta_path = os.path.join(pair_dir, "meta.pkl")
+        pair_encoder = encoder_type
+        if os.path.exists(pair_meta_path):
+            pair_meta = joblib.load(pair_meta_path)
+            pair_encoder = pair_meta.get("encoder", encoder_type)
+
+        feature_names = joblib.load(fn_path)
+        scaler = joblib.load(scaler_path)
+
+        # Check if trained with AEGIS
+        pair_algo = "ppo"
+        if os.path.exists(pair_meta_path):
+            pair_algo = pair_meta.get("algo", "ppo")
+
+        if pair_algo == "aegis":
+            from nandi.models.aegis import AEGISAgent
+            agent = AEGISAgent(n_features=len(feature_names), encoder_type=pair_encoder)
+        else:
+            agent = NandiAgent(n_features=len(feature_names), encoder_type=pair_encoder)
+
+        dummy_ms = torch.zeros(1, lookback, len(feature_names))
+        dummy_pi = torch.zeros(1, 4)
+        agent(dummy_ms, dummy_pi)
+
+        if agent.load_agent(agent_path):
+            agents[pair] = agent
+            scalers[pair] = scaler
+            feature_names_map[pair] = feature_names
+            logger.info(f"Loaded {pair.upper()} agent ({pair_algo}/{pair_encoder})")
+        else:
+            logger.warning(f"Failed to load {pair} agent")
+
+    if not agents:
+        logger.error("No trained models found. Run train_nandi.py first.")
         sys.exit(1)
 
-    scaler = joblib.load(scaler_path)
-    feature_names = joblib.load(os.path.join(MODEL_DIR, "feature_names.pkl"))
-    n_features = len(feature_names)
+    active_pairs = list(agents.keys())
 
-    agent = NandiAgent(n_features=n_features)
-    dummy_ms = np.zeros((1, LOOKBACK_WINDOW, n_features), dtype=np.float32)
-    dummy_pi = np.zeros((1, 4), dtype=np.float32)
-    agent(dummy_ms, dummy_pi)
+    # Initialize orchestrator (wires regime -> alphas -> optimizer -> risk)
+    regime_detector = HMMRegimeDetector()
+    orchestrator = TradingOrchestrator(
+        pairs=active_pairs,
+        agents=agents,
+        regime_detector=regime_detector,
+    )
 
-    if not agent.load_agent():
-        logger.error("Failed to load agent weights. Run train_nandi.py first.")
-        sys.exit(1)
+    # Initialize tail risk hedger and OOD detector
+    tail_hedger = TailRiskHedger()
+    ood_detector = OODDetector()
 
-    logger.info("Nandi agent loaded successfully")
+    # Initialize news intelligence gate
+    news_gate = None
+    if NEWS_CONFIG.get("enabled", False):
+        try:
+            from nandi.data.news.gate import NewsGate
+            news_gate = NewsGate(
+                finnhub_key=NEWS_CONFIG.get("finnhub_key", ""),
+                alpha_vantage_key=NEWS_CONFIG.get("alpha_vantage_key", ""),
+                fred_key=NEWS_CONFIG.get("fred_key", ""),
+            )
+            news_gate.refresh()
+            logger.info("News intelligence gate initialized")
+            logger.info(news_gate.get_status_display())
+        except Exception as e:
+            logger.warning(f"News gate init failed (continuing without): {e}")
+            news_gate = None
 
     # Connect to MT5
+    connector = None
+    position_sync = None
     if not args.paper:
-        sys.path.insert(0, os.path.dirname(__file__))
-        from src.mt5_connector import MT5Connector
+        from nandi.execution.mt5_bridge import MT5Connector
+        from nandi.execution.position_sync import PositionSynchronizer
         connector = MT5Connector(MT5_FILES_DIR)
         if not connector.connect():
             logger.error("Cannot connect to MT5. Make sure EA is running.")
             sys.exit(1)
+        position_sync = PositionSynchronizer(connector)
         logger.info("Connected to MT5")
 
-    # Experience replay for continuous learning
-    experience_buffer = ExperienceReplay()
-
-    position = 0.0
+    # State tracking
+    positions = {pair: 0.0 for pair in active_pairs}
     equity = 10000.0
-    prev_equity = equity
-    trade_count = 0
-    last_learn_time = datetime.now()
 
     logger.info(f"\n{'=' * 60}")
-    logger.info(f"  NANDI — Live Trading {'(PAPER)' if args.paper else '(LIVE)'}")
-    logger.info(f"  Symbol: EURUSD | Interval: {args.interval}s")
+    logger.info(f"  NANDI V2 — Live Trading {'(PAPER)' if args.paper else '(LIVE)'}")
+    logger.info(f"  Timeframe: {args.timeframe}")
+    logger.info(f"  Pairs: {', '.join(p.upper() for p in active_pairs)}")
+    logger.info(f"  Interval: {args.interval}s")
+    logger.info(f"  Leverage: {profile['leverage']}x | MaxPos: {profile['max_position']}")
+    logger.info(f"  Orchestrator: regime + 4 alphas + Kelly + correlation")
     logger.info(f"{'=' * 60}\n")
+
+    # Decision log
+    log_dir = os.path.join("data", "nandi", "live_logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Feature computation function depends on timeframe
+    is_intraday = args.timeframe != "D1"
 
     try:
         while RUNNING:
             try:
                 now = datetime.now()
 
-                # Get latest data
-                if args.paper:
-                    # In paper mode, use downloaded data
-                    df = download_forex_data(years=1)
-                    df = df.tail(LOOKBACK_WINDOW + 100)
-                else:
-                    df = connector.get_historical_data("EURUSD", "D1", LOOKBACK_WINDOW + 100)
+                # Build features for all pairs
+                features_by_pair = {}
+                decision_log = {
+                    "timestamp": now.isoformat(),
+                    "timeframe": args.timeframe,
+                    "signals": {},
+                }
 
-                # Compute features
-                features = compute_features(df)
-                if len(features) < LOOKBACK_WINDOW:
-                    logger.warning(f"Not enough data: {len(features)} < {LOOKBACK_WINDOW}")
+                # For M5 intraday: collect all close prices first for cross-pair features
+                pair_close_cache = {}
+
+                for pair in active_pairs:
+                    try:
+                        if is_intraday:
+                            feat_vals, close_series = _get_intraday_features(
+                                pair, args, connector, lookback,
+                                feature_names_map[pair], scalers[pair],
+                                args.timeframe, return_closes=True,
+                            )
+                            if close_series is not None:
+                                pair_close_cache[pair] = close_series
+                        else:
+                            feat_vals = _get_daily_features(
+                                pair, args, connector, lookback,
+                                feature_names_map[pair], scalers[pair],
+                            )
+
+                        if feat_vals is None:
+                            continue
+
+                        # Build state tuple for orchestrator
+                        portfolio_dd = (orchestrator.current_equity - equity) / orchestrator.current_equity if orchestrator.current_equity > 0 else 0
+                        pos_info = np.array([
+                            positions.get(pair, 0),
+                            equity / 10000 - 1,
+                            max(0, portfolio_dd),
+                            float(np.std(feat_vals[-10:, 0])),
+                        ], dtype=np.float32)
+
+                        features_by_pair[pair] = (feat_vals, pos_info)
+
+                        # OOD detection
+                        try:
+                            if ood_detector.is_fitted:
+                                ood_score = ood_detector.score(feat_vals[-1])
+                                if ood_score > ood_detector.threshold:
+                                    decision_log["signals"][pair] = {
+                                        "ood_warning": True,
+                                        "ood_score": float(ood_score),
+                                    }
+                        except Exception:
+                            pass
+
+                    except Exception as e:
+                        logger.error(f"Error processing {pair}: {e}")
+
+                # Inject cross-pair lead-lag context for M5
+                if is_intraday and len(pair_close_cache) >= 2:
+                    try:
+                        from nandi.data.cross_pair_scalping import compute_cross_pair_scalping_features
+                        for pair in list(features_by_pair.keys()):
+                            cross_feats = compute_cross_pair_scalping_features(
+                                pair, pair_close_cache
+                            )
+                            if len(cross_feats) > 0:
+                                # Append cross-pair signal summary to decision log
+                                last_row = cross_feats.iloc[-1]
+                                usd_flow_cols = [c for c in cross_feats.columns if "usd_flow" in c]
+                                if usd_flow_cols:
+                                    decision_log["signals"].setdefault(pair, {})
+                                    decision_log["signals"][pair]["usd_flow"] = float(last_row.get("usd_flow_3b", 0))
+                    except Exception as e:
+                        logger.debug(f"Cross-pair live features: {e}")
+
+                if not features_by_pair:
                     time.sleep(args.interval)
                     continue
 
-                # Get state
-                feature_vals = scaler.transform(
-                    features[feature_names].values[-LOOKBACK_WINDOW:]
-                ).astype(np.float32)
-
-                dd = max(0, (prev_equity - equity) / prev_equity) if prev_equity > 0 else 0
-                position_info = np.array([
-                    position,
-                    equity / 10000 - 1,
-                    dd,
-                    float(np.std(feature_vals[-10:, 0])),
-                ], dtype=np.float32)
-
-                # Get action
-                action, _, _, uncertainty = agent.get_action(
-                    feature_vals, position_info, deterministic=True
+                # Generate signals via orchestrator
+                target_positions = orchestrator.generate_signals(
+                    features_by_pair,
+                    equity=equity,
+                    positions=positions,
                 )
 
-                # Uncertainty gating
-                if uncertainty > 0.7:
-                    action *= 0.3
-                    logger.info(f"High uncertainty ({uncertainty:.2f}) — reducing position")
-
-                action = float(np.clip(action, -1.0, 1.0))
-
-                # Determine trade signal
-                if action > 0.1:
-                    signal_str = "LONG"
-                elif action < -0.1:
-                    signal_str = "SHORT"
-                else:
-                    signal_str = "FLAT"
-
-                logger.info(
-                    f"[EURUSD] Signal: {signal_str} | "
-                    f"Position: {action:+.3f} | "
-                    f"Uncertainty: {uncertainty:.3f} | "
-                    f"Equity: ${equity:,.2f}"
-                )
-
-                # Execute trade
-                if not args.paper and abs(action - position) > 0.05:
+                # News gate: hard scaling before high-impact events
+                if news_gate and NEWS_CONFIG.get("calendar_gate_enabled", True):
                     try:
-                        lot_size = abs(action) * LIVE_CONFIG["lot_size_base"]
-                        lot_size = max(0.01, round(lot_size, 2))
-
-                        if abs(action) < 0.05:
-                            # Close position
-                            positions = connector.get_open_positions()
-                            for pos in positions:
-                                if pos.get("symbol") == "EURUSD":
-                                    connector.close_trade(pos["ticket"])
-                                    logger.info(f"Closed position {pos['ticket']}")
-                        else:
-                            order_type = "BUY" if action > 0 else "SELL"
-                            tick = connector.get_tick("EURUSD")
-                            entry = tick["ask"] if order_type == "BUY" else tick["bid"]
-
-                            # ATR-based SL/TP
-                            atr = features.iloc[-1].get("atr_14", 0.0010)
-                            if order_type == "BUY":
-                                sl = round(entry - atr * 2, 5)
-                                tp = round(entry + atr * 3, 5)
-                            else:
-                                sl = round(entry + atr * 2, 5)
-                                tp = round(entry - atr * 3, 5)
-
-                            result = connector.open_trade(
-                                "EURUSD", order_type, lot_size, sl, tp,
-                                f"NANDI|u={uncertainty:.2f}"
-                            )
-                            logger.info(f"Trade executed: {result}")
-                            trade_count += 1
+                        news_gate.refresh()
+                        for pair_key in list(target_positions.keys()):
+                            scale = news_gate.get_position_scale(pair_key)
+                            if scale < 1.0:
+                                target_positions[pair_key] *= scale
+                                decision_log["signals"].setdefault(pair_key, {})
+                                decision_log["signals"][pair_key]["news_gate_scale"] = scale
                     except Exception as e:
-                        logger.error(f"Trade execution failed: {e}")
+                        logger.debug(f"News gate error: {e}")
 
-                # Store experience for learning
-                reward = (equity - prev_equity) / 10000 if prev_equity > 0 else 0
-                experience_buffer.add(
-                    market_state=feature_vals,
-                    position_info=position_info,
-                    action=action,
-                    reward=reward,
-                    next_market_state=feature_vals,
-                    next_position_info=position_info,
-                    done=False,
-                    metadata={
-                        "signal": signal_str,
-                        "uncertainty": float(uncertainty),
-                        "equity": float(equity),
-                    },
-                )
+                # Tail risk hedging
+                try:
+                    port_ret = sum(
+                        positions.get(p, 0) * features_by_pair[p][0][-1, 0]
+                        for p in active_pairs if p in features_by_pair
+                    ) / max(len(active_pairs), 1)
+                    tail_hedger.update(port_ret)
+                    scale = tail_hedger.compute_hedge_ratio()
+                    if scale < 1.0:
+                        logger.warning(f"Tail risk hedger scaling positions by {scale:.2f}")
+                        target_positions = {p: v * scale for p, v in target_positions.items()}
+                except Exception:
+                    pass
 
-                # Online learning every hour
-                hours_since_learn = (now - last_learn_time).seconds / 3600
-                if hours_since_learn >= 1 and len(experience_buffer.buffer) >= 32:
-                    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
-                    online_learn(agent, experience_buffer, optimizer)
-                    last_learn_time = now
+                # Log decisions
+                decision_log["target_positions"] = target_positions
+                decision_log["equity"] = equity
 
-                prev_equity = equity
-                position = action
+                # Execute
+                if not args.paper and position_sync:
+                    actions = position_sync.sync(target_positions)
+                    if actions:
+                        decision_log["executions"] = actions
+
+                # Update state
+                positions = target_positions
 
                 # Update equity from MT5
-                if not args.paper:
+                if not args.paper and connector:
                     try:
                         account = connector.get_account_info()
                         equity = account["equity"]
                     except Exception:
                         pass
+
+                # Print status
+                total_exposure = sum(abs(v) for v in positions.values())
+                active_positions = {p: v for p, v in positions.items() if abs(v) > 0.05}
+
+                logger.info(
+                    f"[{now.strftime('%H:%M:%S')}] {args.timeframe} | "
+                    f"Equity: ${equity:,.0f} | "
+                    f"Exposure: {total_exposure:.2f} | "
+                    f"Active: {len(active_positions)}/{len(active_pairs)}"
+                )
+
+                for p, v in active_positions.items():
+                    sig = "LONG" if v > 0 else "SHORT"
+                    logger.info(f"  {p.upper():>8s}: {sig} {abs(v):.3f}")
+
+                # Save decision log
+                log_file = os.path.join(
+                    log_dir, f"decisions_{args.timeframe}_{now.strftime('%Y%m%d')}.jsonl"
+                )
+                with open(log_file, "a") as f:
+                    f.write(json.dumps(decision_log) + "\n")
 
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
@@ -354,12 +382,99 @@ def main():
             time.sleep(args.interval)
 
     finally:
-        logger.info(f"\nShutting down Nandi...")
-        logger.info(f"Total trades: {trade_count}")
-        logger.info(f"Experience buffer: {experience_buffer.stats()}")
-        if not args.paper:
+        logger.info(f"\nShutting down Nandi V2...")
+        if not args.paper and connector:
             connector.disconnect()
         logger.info("Nandi stopped.")
+
+
+def _get_daily_features(pair, args, connector, lookback, feature_names, scaler):
+    """Build D1 features for a pair (original pipeline)."""
+    from nandi.data.manager import download_forex_data
+    from nandi.data.features import compute_features
+    from nandi.data.advanced_features import compute_advanced_features
+
+    if args.paper:
+        df = download_forex_data(symbol=pair, years=1)
+        df = df.tail(lookback + 100)
+    else:
+        from nandi.config import PAIRS_MT5
+        mt5_sym = PAIRS_MT5.get(pair, pair.upper())
+        df = connector.get_historical_data(mt5_sym, "D1", lookback + 100)
+
+    features = compute_features(df)
+    try:
+        adv = compute_advanced_features(df)
+        features = features.join(adv, how='left')
+    except Exception:
+        pass
+
+    features.dropna(inplace=True)
+    if len(features) < lookback:
+        return None
+
+    # Pad missing columns
+    for c in feature_names:
+        if c not in features.columns:
+            features[c] = 0.0
+
+    feat_vals = scaler.transform(
+        features[feature_names].values[-lookback:]
+    ).astype(np.float32)
+
+    return feat_vals
+
+
+def _get_intraday_features(pair, args, connector, lookback, feature_names,
+                           scaler, timeframe, return_closes=False):
+    """Build M5 features for a pair (scalping pipeline).
+
+    Args:
+        return_closes: if True, also return the close price Series
+                       (used for cross-pair lead-lag computation).
+    """
+    from nandi.data.mt5_data import MT5DataFetcher
+    from nandi.data.scalping_features import compute_scalping_features
+    from nandi.config import TIMEFRAME_PROFILES
+
+    profile = TIMEFRAME_PROFILES.get(timeframe, TIMEFRAME_PROFILES["M5"])
+
+    if args.paper:
+        # In paper mode, use synthetic data from daily
+        from nandi.data.manager import download_forex_data
+        from nandi.data.mt5_data import generate_synthetic_m5
+        daily_df = download_forex_data(symbol=pair, years=1)
+        daily_df = daily_df.tail(5)  # last 5 days of synthetic M5
+        df = generate_synthetic_m5(daily_df, pair_name=pair)
+    else:
+        # Live: read from MT5 bridge
+        fetcher = MT5DataFetcher()
+        df = fetcher.fetch(pair, bars=lookback + 200)
+
+    if df is None or len(df) < lookback:
+        return (None, None) if return_closes else None
+
+    # Save close prices before feature computation (for cross-pair)
+    close_series = df["close"].copy() if return_closes else None
+
+    features = compute_scalping_features(df, profile=profile)
+    features.dropna(inplace=True)
+
+    if len(features) < lookback:
+        return (None, None) if return_closes else None
+
+    # Pad missing columns
+    for c in feature_names:
+        if c not in features.columns:
+            features[c] = 0.0
+
+    feat_vals = scaler.transform(
+        features[feature_names].values[-lookback:]
+    ).astype(np.float32)
+
+    if return_closes:
+        return feat_vals, close_series
+    return feat_vals
 
 
 if __name__ == "__main__":

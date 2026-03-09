@@ -2,14 +2,15 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+.venv/
 .env
 *.egg-info/
 dist/
 build/
 
 # Data & models (too large for git)
-data/
-models/
+/data/
+/models/
 *.keras
 *.pkl
 *.h5
@@ -25,3 +26,7 @@ Thumbs.db
 
 # TF logs
 logs/
+
+# Dashboard output
+training_dashboard.png
+*.jsonl

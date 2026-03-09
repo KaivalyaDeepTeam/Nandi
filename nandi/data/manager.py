@@ -1,0 +1,396 @@
+"""
+Multi-Pair Data Manager — Downloads, caches, and prepares data for 8 forex pairs.
+
+Supports D1 (daily via Stooq) and M5 (intraday via MT5/synthetic) timeframes.
+"""
+
+import os
+import logging
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+
+from nandi.config import (
+    DATA_DIR, PAIRS, LOOKBACK_YEARS, TEST_MONTHS, LOOKBACK_WINDOW,
+    TIMEFRAME_PROFILES,
+)
+from nandi.data.features import compute_features
+from nandi.data.advanced_features import compute_advanced_features
+from nandi.data.timeframes import derive_h4_proxy, derive_h1_proxy
+
+logger = logging.getLogger(__name__)
+
+
+def download_forex_data(symbol="eurusd", years=LOOKBACK_YEARS):
+    """Download daily OHLC from Stooq (free, reliable, 20+ years)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    cache = os.path.join(DATA_DIR, f"{symbol}_daily.csv")
+
+    if os.path.exists(cache):
+        logger.info(f"Loading cached data from {cache}")
+        df = pd.read_csv(cache, index_col="Date", parse_dates=True)
+        return df
+
+    end = pd.Timestamp.now()
+    start = end - pd.DateOffset(years=years)
+    d1 = start.strftime("%Y%m%d")
+    d2 = end.strftime("%Y%m%d")
+
+    logger.info(f"Downloading {years} years of {symbol.upper()} from Stooq...")
+    url = f"https://stooq.com/q/d/l/?s={symbol}&d1={d1}&d2={d2}&i=d"
+    df = pd.read_csv(url)
+
+    if df.empty:
+        raise ValueError(f"No data returned for {symbol}")
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.set_index("Date", inplace=True)
+    df.sort_index(inplace=True)
+    df.columns = [c.lower() for c in df.columns]
+
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    df.dropna(inplace=True)
+    df.to_csv(cache)
+    logger.info(f"Downloaded {len(df)} daily bars: {df.index[0].date()} -> {df.index[-1].date()}")
+    return df
+
+
+class DataManager:
+    """Multi-pair data pipeline: download, feature computation, normalization, splitting.
+
+    Supports timeframe routing:
+    - D1: Stooq daily data -> compute_features (original pipeline)
+    - M5: MT5 file bridge or synthetic M5 -> compute_scalping_features
+    """
+
+    def __init__(self, pairs=None, years=LOOKBACK_YEARS, test_months=TEST_MONTHS,
+                 lookback_window=LOOKBACK_WINDOW, timeframe="D1"):
+        self.pairs = pairs or PAIRS
+        self.years = years
+        self.test_months = test_months
+        self.timeframe = timeframe
+
+        # Use profile lookback if not explicitly set
+        profile = TIMEFRAME_PROFILES.get(timeframe, TIMEFRAME_PROFILES["D1"])
+        self.lookback_window = profile["lookback_bars"] if lookback_window == LOOKBACK_WINDOW else lookback_window
+
+        self.raw_data = {}       # pair -> raw OHLCV DataFrame
+        self.features = {}       # pair -> features DataFrame
+        self.scalers = {}        # pair -> RobustScaler
+        self.pair_data = {}      # pair -> dict with train/test splits
+
+    def prepare_all(self):
+        """Download and prepare data for all pairs. Returns dict of pair -> data dict.
+
+        For M5: uses two-pass approach:
+          Pass 1: Download data + compute per-pair features (no split yet)
+          Pass 2: Compute cross-pair lead-lag features, inject, THEN split+scale
+        This ensures the agent sees what other pairs did before making a trade.
+        """
+        if self.timeframe != "D1" and len(self.pairs) > 1:
+            return self._prepare_all_m5_with_cross_features()
+
+        # D1 or single-pair: original pipeline
+        for pair in self.pairs:
+            try:
+                self.pair_data[pair] = self.prepare_pair(pair)
+            except Exception as e:
+                logger.error(f"Failed to prepare {pair}: {e}")
+                continue
+
+        # Cross-pair features (D1 — same-bar correlations, DXY proxy)
+        if self.timeframe == "D1":
+            try:
+                from nandi.data.cross_features import compute_all_cross_features
+                closes_df = self.get_all_closes()
+                if len(closes_df) > 0:
+                    cross = compute_all_cross_features(closes_df)
+                    self.cross_features = cross
+                    logger.info("Cross-pair features computed (DXY proxy, spread z-scores, correlations)")
+            except Exception as e:
+                logger.warning(f"Cross-pair features failed: {e}")
+                self.cross_features = None
+
+        logger.info(f"Prepared {len(self.pair_data)}/{len(self.pairs)} pairs "
+                    f"({self.timeframe}) successfully")
+        return self.pair_data
+
+    def _prepare_all_m5_with_cross_features(self):
+        """Two-pass M5 pipeline with cross-pair lead-lag features.
+
+        Pass 1: Download + per-pair features for ALL pairs
+        Pass 2: Compute lead-lag signals across pairs, inject, then split+scale
+
+        This gives the agent knowledge like "EURUSD moved up 2 bars ago,
+        GBPUSD hasn't moved yet — catch-up trade opportunity."
+        """
+        from nandi.data.mt5_data import MT5DataFetcher, generate_synthetic_m5, filter_session_hours
+        from nandi.data.scalping_features import compute_scalping_features
+        from nandi.data.cross_pair_scalping import compute_cross_pair_scalping_features
+        from nandi.config import SCALPING_CONFIG
+
+        profile = TIMEFRAME_PROFILES.get(self.timeframe, TIMEFRAME_PROFILES["M5"])
+
+        # ── Pass 1: Download data + per-pair features ──
+        pair_dfs = {}       # pair -> filtered OHLCV DataFrame
+        pair_features = {}  # pair -> per-pair features DataFrame
+        pair_closes = {}    # pair -> close price Series (for cross-pair calc)
+
+        for pair in self.pairs:
+            try:
+                df = None
+
+                # Priority 1: Cached M5 CSV (from HistData/fast_download.py)
+                m5_cache = os.path.join(DATA_DIR, "m5", f"{pair}_m5_7y.csv")
+                if os.path.exists(m5_cache):
+                    try:
+                        df = pd.read_csv(m5_cache, index_col=0, parse_dates=True)
+                        if len(df) >= profile["lookback_bars"] * 2:
+                            logger.info(f"[{pair.upper()}] Loaded cached M5 data ({len(df):,} bars)")
+                        else:
+                            df = None
+                    except Exception as e:
+                        logger.warning(f"[{pair.upper()}] Cache load failed: {e}")
+                        df = None
+
+                # Priority 2: MT5 file bridge
+                if df is None:
+                    fetcher = MT5DataFetcher()
+                    df = fetcher.fetch(pair)
+
+                # Priority 3: Synthetic fallback (last resort)
+                if df is None or len(df) < profile["lookback_bars"] * 2:
+                    logger.info(f"[{pair.upper()}] No real M5 data — generating synthetic M5 from daily")
+                    daily_df = download_forex_data(symbol=pair, years=self.years)
+                    df = generate_synthetic_m5(daily_df, pair_name=pair)
+
+                if df is None or len(df) == 0:
+                    logger.error(f"No M5 data available for {pair}")
+                    continue
+
+                self.raw_data[pair] = df
+
+                if SCALPING_CONFIG.get("session_filter", True):
+                    df = filter_session_hours(df)
+
+                features = compute_scalping_features(df, profile=profile)
+                features.dropna(inplace=True)
+
+                if len(features) < profile["lookback_bars"] * 2:
+                    logger.warning(f"[{pair.upper()}] Insufficient M5 bars after features: {len(features)}")
+                    continue
+
+                pair_dfs[pair] = df
+                pair_features[pair] = features
+                pair_closes[pair] = df.loc[features.index, "close"]
+
+            except Exception as e:
+                logger.error(f"Failed to prepare {pair} (pass 1): {e}")
+
+        if not pair_features:
+            logger.error("No pairs survived pass 1")
+            return self.pair_data
+
+        # ── Pass 2: Compute cross-pair lead-lag features + inject ──
+        # Align all close prices to common timestamps
+        all_closes = {}
+        common_idx = None
+        for pair, closes in pair_closes.items():
+            if common_idx is None:
+                common_idx = closes.index
+            else:
+                common_idx = common_idx.intersection(closes.index)
+
+        if common_idx is not None and len(common_idx) > 0:
+            for pair in pair_closes:
+                all_closes[pair] = pair_closes[pair].reindex(common_idx)
+
+        n_cross_features = 0
+        for pair in list(pair_features.keys()):
+            try:
+                if len(all_closes) >= 2:
+                    cross_feats = compute_cross_pair_scalping_features(
+                        pair, all_closes
+                    )
+
+                    if len(cross_feats) > 0:
+                        # Align cross features with per-pair features
+                        common = pair_features[pair].index.intersection(cross_feats.index)
+                        if len(common) > 0:
+                            per_pair = pair_features[pair].loc[common]
+                            cross = cross_feats.loc[common].fillna(0)
+                            combined = per_pair.join(cross, how='left').fillna(0)
+                            pair_features[pair] = combined
+                            n_cross_features = len(cross_feats.columns)
+
+                # Now split and scale
+                self.features[pair] = pair_features[pair]
+                self.pair_data[pair] = self._split_and_scale(
+                    pair, pair_dfs[pair], pair_features[pair]
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to prepare {pair} (pass 2): {e}")
+
+        if n_cross_features > 0:
+            logger.info(
+                f"Injected {n_cross_features} cross-pair lead-lag features into each pair "
+                f"(lagged returns, USD flow, divergence, consensus)"
+            )
+
+        logger.info(f"Prepared {len(self.pair_data)}/{len(self.pairs)} pairs "
+                    f"({self.timeframe}) successfully")
+        return self.pair_data
+
+    def prepare_pair(self, pair):
+        """Full pipeline for a single pair: data -> features -> normalize -> split."""
+        if self.timeframe == "D1":
+            return self._prepare_pair_d1(pair)
+        else:
+            return self._prepare_pair_m5(pair)
+
+    def _prepare_pair_d1(self, pair):
+        """Original D1 pipeline: Stooq download -> compute_features -> split."""
+        df = download_forex_data(symbol=pair, years=self.years)
+        self.raw_data[pair] = df
+
+        features = compute_features(df)
+
+        # Add advanced mathematical features
+        try:
+            adv_features = compute_advanced_features(df)
+            features = features.join(adv_features, how='left')
+        except Exception as e:
+            logger.warning(f"[{pair}] Advanced features failed: {e}")
+
+        # Add H4/H1 proxy features
+        try:
+            h4_feats = derive_h4_proxy(df)
+            h1_feats = derive_h1_proxy(df)
+            features = features.join(h4_feats, how='left').join(h1_feats, how='left')
+        except Exception as e:
+            logger.warning(f"[{pair}] Timeframe features failed: {e}")
+
+        features.dropna(inplace=True)
+        self.features[pair] = features
+
+        return self._split_and_scale(pair, df, features)
+
+    def _prepare_pair_m5(self, pair):
+        """M5 pipeline: cached CSV -> MT5 bridge -> synthetic fallback -> scalping features -> split."""
+        from nandi.data.mt5_data import MT5DataFetcher, generate_synthetic_m5, filter_session_hours
+        from nandi.data.scalping_features import compute_scalping_features
+
+        profile = TIMEFRAME_PROFILES.get(self.timeframe, TIMEFRAME_PROFILES["M5"])
+        df = None
+
+        # Priority 1: Cached M5 CSV (from HistData/fast_download.py)
+        m5_cache = os.path.join(DATA_DIR, "m5", f"{pair}_m5_7y.csv")
+        if os.path.exists(m5_cache):
+            try:
+                df = pd.read_csv(m5_cache, index_col=0, parse_dates=True)
+                if len(df) >= profile["lookback_bars"] * 2:
+                    logger.info(f"[{pair.upper()}] Loaded cached M5 data ({len(df):,} bars)")
+                else:
+                    df = None
+            except Exception as e:
+                logger.warning(f"[{pair.upper()}] Cache load failed: {e}")
+                df = None
+
+        # Priority 2: MT5 file bridge
+        if df is None:
+            fetcher = MT5DataFetcher()
+            df = fetcher.fetch(pair)
+
+        # Priority 3: Synthetic fallback (last resort)
+        if df is None or len(df) < profile["lookback_bars"] * 2:
+            logger.info(f"[{pair.upper()}] No real M5 data — generating synthetic M5 from daily")
+            daily_df = download_forex_data(symbol=pair, years=self.years)
+            df = generate_synthetic_m5(daily_df, pair_name=pair)
+
+        if df is None or len(df) == 0:
+            raise ValueError(f"No M5 data available for {pair}")
+
+        self.raw_data[pair] = df
+
+        # Apply session filter (keep London+NY, drop Asian)
+        from nandi.config import SCALPING_CONFIG
+        if SCALPING_CONFIG.get("session_filter", True):
+            df = filter_session_hours(df)
+
+        # Compute scalping features
+        features = compute_scalping_features(df, profile=profile)
+        features.dropna(inplace=True)
+        self.features[pair] = features
+
+        return self._split_and_scale(pair, df, features)
+
+    def _split_and_scale(self, pair, df, features):
+        """Common split + normalize logic for both D1 and M5."""
+        # Align price data with features
+        df_aligned = df.loc[features.index]
+
+        # Train/test split by date
+        if self.timeframe == "D1":
+            test_start = features.index[-1] - pd.DateOffset(months=self.test_months)
+        else:
+            # For M5: test_months in bars (approximate)
+            test_bars = int(self.test_months * 22 * 288)  # ~22 trading days/month * 288 bars/day
+            test_bars = min(test_bars, len(features) // 4)  # max 25% test
+            test_start = features.index[-test_bars] if test_bars > 0 else features.index[-1]
+
+        train_mask = features.index < test_start
+        test_mask = features.index >= test_start
+
+        if train_mask.sum() < 10 or test_mask.sum() < 10:
+            raise ValueError(f"Insufficient data for {pair} ({self.timeframe}): "
+                           f"train={train_mask.sum()}, test={test_mask.sum()}")
+
+        # Normalize using training statistics only
+        scaler = RobustScaler()
+        feature_vals = features.values.astype(np.float32)
+        train_scaled = scaler.fit_transform(feature_vals[train_mask]).astype(np.float32)
+        test_scaled = scaler.transform(feature_vals[test_mask]).astype(np.float32)
+        self.scalers[pair] = scaler
+
+        n_train = train_mask.sum()
+        n_test = test_mask.sum()
+        label = "days" if self.timeframe == "D1" else "bars"
+        logger.info(
+            f"[{pair.upper()}] {self.timeframe} Train: {n_train} {label} | "
+            f"Test: {n_test} {label}"
+        )
+
+        return {
+            "pair": pair,
+            "df": df_aligned,
+            "features": features,
+            "feature_names": list(features.columns),
+            "train_features": train_scaled,
+            "test_features": test_scaled,
+            "train_prices": df_aligned[train_mask]["close"].values,
+            "test_prices": df_aligned[test_mask]["close"].values,
+            "train_dates": features.index[train_mask],
+            "test_dates": features.index[test_mask],
+            "scaler": scaler,
+            "n_features": features.shape[1],
+            "timeframe": self.timeframe,
+        }
+
+    def get_common_dates(self):
+        """Get date range common to all pairs (for synchronized backtesting)."""
+        if not self.features:
+            return None
+        date_sets = [set(f.index) for f in self.features.values()]
+        common = sorted(set.intersection(*date_sets))
+        return pd.DatetimeIndex(common)
+
+    def get_all_closes(self):
+        """Returns DataFrame of close prices for all pairs, aligned by date."""
+        closes = {}
+        for pair, df in self.raw_data.items():
+            closes[pair] = df["close"]
+        return pd.DataFrame(closes).dropna()

@@ -1,12 +1,14 @@
 """
-Backtest Nandi on unseen test data.
+Backtest Nandi V2 — Multi-pair portfolio backtesting on unseen data.
 
-Runs the trained agent on held-out data it has NEVER seen during training,
-simulating realistic trading with transaction costs and risk limits.
+Uses event-driven backtester with realistic execution simulation,
+Monte Carlo permutation testing, stress testing, and OOD detection.
 
 Usage:
     python backtest_nandi.py
+    python backtest_nandi.py --timeframe M5
     python backtest_nandi.py --test-months 3
+    python backtest_nandi.py --pairs eurusd gbpusd --monte-carlo
 """
 
 import argparse
@@ -16,7 +18,8 @@ import sys
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
+import joblib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,165 +28,309 @@ logging.basicConfig(
 logger = logging.getLogger("nandi")
 
 np.random.seed(42)
-tf.random.set_seed(42)
+torch.manual_seed(42)
+
+
+def report_scalping_metrics(pair_results, pair_data, timeframe):
+    """Report M5-specific metrics: trades/day, avg hold time, profit per trade."""
+    if timeframe == "D1":
+        return
+
+    logger.info(f"\n{'─' * 60}")
+    logger.info("  SCALPING METRICS")
+    logger.info(f"{'─' * 60}")
+
+    for pair, result in pair_results.items():
+        trades = result.get("trades", [])
+        if not trades:
+            logger.info(f"  {pair.upper():>8s}: No trades")
+            continue
+
+        n_trades = len(trades)
+        # Estimate trading days from test data length
+        if pair in pair_data:
+            n_bars = len(pair_data[pair]["test_prices"])
+            n_days = max(1, n_bars / 288)  # 288 M5 bars per day
+        else:
+            n_days = 1
+
+        trades_per_day = n_trades / n_days
+
+        # Avg hold time (in bars -> hours for M5)
+        hold_times = [t.get("hold_bars", 0) for t in trades if "hold_bars" in t]
+        avg_hold_bars = np.mean(hold_times) if hold_times else 0
+        avg_hold_hours = avg_hold_bars * 5 / 60  # M5 = 5 min per bar
+
+        # Profit per trade
+        profits = [t.get("pnl", 0) for t in trades if "pnl" in t]
+        avg_profit = np.mean(profits) if profits else 0
+        win_rate = sum(1 for p in profits if p > 0) / max(len(profits), 1)
+
+        logger.info(
+            f"  {pair.upper():>8s} | "
+            f"Trades/day: {trades_per_day:.1f} | "
+            f"Avg hold: {avg_hold_hours:.1f}h ({avg_hold_bars:.0f} bars) | "
+            f"Avg P/L: ${avg_profit:.2f} | "
+            f"WR: {win_rate:.1%}"
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest Nandi on unseen data")
-    parser.add_argument("--test-months", type=int, default=2)
+    parser = argparse.ArgumentParser(description="Backtest Nandi V2 Portfolio")
+    parser.add_argument("--test-months", type=int, default=6)
     parser.add_argument("--years", type=int, default=20)
+    parser.add_argument("--pairs", nargs="+", default=None)
+    parser.add_argument("--timeframe", type=str, default="D1",
+                        choices=["D1", "M5"],
+                        help="Trading timeframe (default: D1)")
+    parser.add_argument("--monte-carlo", action="store_true",
+                        help="Run Monte Carlo significance test")
+    parser.add_argument("--stress-test", action="store_true",
+                        help="Run stress tests against historical crises")
+    parser.add_argument("--ood", action="store_true",
+                        help="Run OOD detection on test data")
+    parser.add_argument("--full", action="store_true",
+                        help="Run all tests (Monte Carlo + stress + OOD)")
     args = parser.parse_args()
 
-    from nandi.config import MODEL_DIR, LOOKBACK_WINDOW, INITIAL_BALANCE, LEVERAGE
-    from nandi.config import TRANSACTION_COST_BPS, RISK_LIMITS
-    from nandi.data import prepare_data
-    from nandi.model import NandiAgent
+    if args.full:
+        args.monte_carlo = True
+        args.stress_test = True
+        args.ood = True
 
-    # ── Load data ──
-    data = prepare_data(
-        lookback_window=LOOKBACK_WINDOW,
-        test_months=args.test_months,
-        years=args.years,
-    )
+    from nandi.config import MODEL_DIR, INITIAL_BALANCE, PAIRS, TIMEFRAME_PROFILES
+    from nandi.data.manager import DataManager
+    from nandi.models.agent import NandiAgent
+    from nandi.backtest.event_engine import EventDrivenBacktester
 
-    test_features = data["test_features"]
-    test_prices = data["test_prices"]
-    test_dates = data["test_dates"]
+    profile = TIMEFRAME_PROFILES.get(args.timeframe, TIMEFRAME_PROFILES["D1"])
+    lookback = profile["lookback_bars"]
 
-    # ── Load trained agent ──
-    agent = NandiAgent(n_features=data["n_features"])
-    dummy_ms = np.zeros((1, LOOKBACK_WINDOW, data["n_features"]), dtype=np.float32)
-    dummy_pi = np.zeros((1, 4), dtype=np.float32)
-    agent(dummy_ms, dummy_pi)
+    # Determine which pairs have trained models
+    trained_pairs_path = os.path.join(MODEL_DIR, "trained_pairs.pkl")
+    if os.path.exists(trained_pairs_path):
+        available_pairs = joblib.load(trained_pairs_path)
+    else:
+        available_pairs = PAIRS
 
-    if not agent.load_agent():
-        logger.error("No trained model found. Run train_nandi.py first.")
+    pairs = args.pairs or available_pairs
+
+    # Load training metadata for encoder type
+    meta_path = os.path.join(MODEL_DIR, "training_meta.pkl")
+    encoder_type = "msfan"
+    if os.path.exists(meta_path):
+        meta = joblib.load(meta_path)
+        encoder_type = meta.get("encoder", "msfan")
+
+    # Load agents
+    agents = {}
+    for pair in pairs:
+        pair_dir = os.path.join(MODEL_DIR, pair)
+        agent_path = os.path.join(pair_dir, "agent.pt")
+        fn_path = os.path.join(pair_dir, "feature_names.pkl")
+
+        if not os.path.exists(agent_path):
+            logger.warning(f"No trained model for {pair}, skipping")
+            continue
+
+        # Check per-pair encoder type
+        pair_meta_path = os.path.join(pair_dir, "meta.pkl")
+        pair_encoder = encoder_type
+        if os.path.exists(pair_meta_path):
+            pair_meta = joblib.load(pair_meta_path)
+            pair_encoder = pair_meta.get("encoder", encoder_type)
+
+        feature_names = joblib.load(fn_path)
+
+        # Check if this was trained with AEGIS
+        pair_algo = "ppo"
+        if os.path.exists(pair_meta_path):
+            pair_algo = pair_meta.get("algo", "ppo")
+
+        if pair_algo == "aegis":
+            from nandi.models.aegis import AEGISAgent
+            agent = AEGISAgent(n_features=len(feature_names), encoder_type=pair_encoder)
+        else:
+            agent = NandiAgent(n_features=len(feature_names), encoder_type=pair_encoder)
+
+        dummy_ms = torch.zeros(1, lookback, len(feature_names))
+        dummy_pi = torch.zeros(1, 4)
+        agent(dummy_ms, dummy_pi)
+
+        if agent.load_agent(agent_path):
+            agents[pair] = agent
+            logger.info(f"Loaded {pair.upper()} agent ({pair_algo}/{pair_encoder}, {len(feature_names)} features)")
+        else:
+            logger.warning(f"Failed to load {pair} agent")
+
+    if not agents:
+        logger.error("No trained models found. Run train_nandi.py first.")
         sys.exit(1)
 
-    logger.info("Loaded trained Nandi agent")
+    # Prepare data
+    dm = DataManager(pairs=list(agents.keys()), years=args.years,
+                     test_months=args.test_months, timeframe=args.timeframe)
+    pair_data = dm.prepare_all()
 
-    # ── Run backtest ──
-    logger.info(f"\nBacktesting on {len(test_prices)} unseen days...")
-    logger.info(f"Period: {test_dates[0].date()} → {test_dates[-1].date()}")
+    # ── Event-Driven Backtest ──
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"  NANDI V2 EVENT-DRIVEN BACKTEST ({args.timeframe})")
+    logger.info(f"  Pairs: {', '.join(p.upper() for p in agents.keys())}")
+    logger.info(f"  Test window: {args.test_months} months")
+    logger.info(f"  Lookback: {lookback} bars")
+    logger.info(f"{'=' * 60}")
 
-    equity = INITIAL_BALANCE
-    peak_equity = INITIAL_BALANCE
-    position = 0.0
-    trades = []
+    pair_results = {}
+    portfolio_equity_curves = []
+    portfolio_daily_returns = []
 
-    for i in range(LOOKBACK_WINDOW, len(test_features) - 1):
-        # Get state
-        market_state = test_features[i - LOOKBACK_WINDOW:i]
-        dd = (peak_equity - equity) / peak_equity
-        position_info = np.array([
-            position,
-            equity / INITIAL_BALANCE - 1,
-            dd,
-            float(np.std(test_features[max(0, i - 10):i, 0])) if i > 10 else 1.0,
-        ], dtype=np.float32)
+    for pair, agent in agents.items():
+        if pair not in pair_data:
+            continue
 
-        # Get action from agent
-        action, _, _, uncertainty = agent.get_action(
-            market_state, position_info, deterministic=True
+        data = pair_data[pair]
+        backtester = EventDrivenBacktester(
+            agent=agent,
+            pair_name=pair,
+            initial_balance=INITIAL_BALANCE,
         )
 
-        # Uncertainty gating: reduce position if uncertain
-        if uncertainty > 0.7:
-            action *= 0.3
+        result = backtester.run(
+            features=data["test_features"],
+            prices=data["test_prices"],
+            lookback=lookback,
+        )
 
-        # Risk limit: scale down at drawdown threshold
-        if dd > RISK_LIMITS["scale_down_threshold"]:
-            action *= 0.5
+        pair_results[pair] = result
+        portfolio_equity_curves.append(result["equity_curve"])
+        portfolio_daily_returns.append(result["daily_returns"])
 
-        # Force flat at max drawdown
-        if dd > RISK_LIMITS["max_drawdown"]:
-            action = 0.0
+        m = result["metrics"]
+        logger.info(
+            f"  {pair.upper():>8s} | "
+            f"Return: {m['total_return_pct']:+7.2f}% | "
+            f"Sharpe: {m['sharpe']:5.2f} | "
+            f"MaxDD: {m['max_drawdown']:.2%} | "
+            f"WR: {m['win_rate']:.1%} | "
+            f"PF: {m['profit_factor']:.2f} | "
+            f"Trades: {m['n_trades']} | "
+            f"Avg R: {m['avg_r_multiple']:.3f}"
+        )
 
-        action = float(np.clip(action, -1.0, 1.0))
+    # ── Scalping Metrics (M5 only) ──
+    report_scalping_metrics(pair_results, pair_data, args.timeframe)
 
-        # Simulate
-        price_now = test_prices[i]
-        price_next = test_prices[i + 1]
-        market_ret = (price_next - price_now) / price_now
+    # ── Portfolio Aggregation ──
+    if portfolio_daily_returns:
+        # Equal-weight portfolio returns
+        min_len = min(len(r) for r in portfolio_daily_returns)
+        trimmed = [r[:min_len] for r in portfolio_daily_returns]
+        portfolio_returns = np.mean(trimmed, axis=0)
 
-        # P&L
-        pnl = position * market_ret * equity * LEVERAGE
-        cost = abs(action - position) * equity * TRANSACTION_COST_BPS / 10000
+        from nandi.utils.metrics import sharpe_ratio, sortino_ratio, calmar_ratio, max_drawdown
+        port_equity = INITIAL_BALANCE * np.cumprod(1 + portfolio_returns)
 
-        equity += pnl - cost
-        peak_equity = max(peak_equity, equity)
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  PORTFOLIO RESULTS — {len(pair_results)} Pairs ({args.timeframe})")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"  Total Return:     {(port_equity[-1] / INITIAL_BALANCE - 1) * 100:+.2f}%")
+        logger.info(f"  Sharpe Ratio:     {sharpe_ratio(portfolio_returns):.2f}")
+        logger.info(f"  Sortino Ratio:    {sortino_ratio(portfolio_returns):.2f}")
+        logger.info(f"  Calmar Ratio:     {calmar_ratio(portfolio_returns):.2f}")
+        logger.info(f"  Max Drawdown:     {max_drawdown(portfolio_returns):.2%}")
 
-        # Track position changes as trades
-        if abs(action - position) > 0.05:
-            trades.append({
-                "date": test_dates[i],
-                "action": "LONG" if action > 0.1 else ("SHORT" if action < -0.1 else "FLAT"),
-                "position": round(action, 3),
-                "price": price_now,
-                "pnl": round(pnl - cost, 2),
-                "equity": round(equity, 2),
-                "uncertainty": round(uncertainty, 3),
-                "drawdown": round(dd, 4),
-            })
+    # ── Monte Carlo Significance Test ──
+    if args.monte_carlo and portfolio_daily_returns:
+        logger.info(f"\n{'─' * 60}")
+        logger.info("  MONTE CARLO SIGNIFICANCE TEST (1000 permutations)")
+        logger.info(f"{'─' * 60}")
 
-        position = action
+        from nandi.backtest.monte_carlo import MonteCarloValidator
+        mc = MonteCarloValidator(n_permutations=1000)
 
-    # ── Results ──
-    total_return = (equity / INITIAL_BALANCE - 1) * 100
-    max_dd = (peak_equity - min(t["equity"] for t in trades)) / peak_equity * 100 if trades else 0
+        # Test portfolio
+        mc_result = mc.test_significance(portfolio_returns)
+        logger.info(f"  Portfolio Sharpe: {mc_result['real_sharpe']:.3f}")
+        logger.info(f"  p-value:          {mc_result['p_value']:.4f} {mc_result['significance_level']}")
+        logger.info(f"  Null mean/std:    {mc_result['null_mean']:.3f} +/- {mc_result['null_std']:.3f}")
+        logger.info(f"  Significant:      {'YES' if mc_result['is_significant'] else 'NO'}")
 
-    tdf = pd.DataFrame(trades)
+        # Test each pair
+        for pair, result in pair_results.items():
+            mc_pair = mc.test_significance(result["daily_returns"])
+            logger.info(
+                f"  {pair.upper():>8s}: Sharpe={mc_pair['real_sharpe']:.3f}, "
+                f"p={mc_pair['p_value']:.4f} {mc_pair['significance_level']}"
+            )
 
-    if len(tdf) == 0:
-        logger.info("No trades generated.")
-        return
+    # ── Stress Testing ──
+    if args.stress_test:
+        logger.info(f"\n{'─' * 60}")
+        logger.info("  STRESS TESTING — Historical Crisis Periods")
+        logger.info(f"{'─' * 60}")
 
-    profitable = tdf[tdf["pnl"] > 0]
-    losing = tdf[tdf["pnl"] <= 0]
-    n_trades = len(tdf)
-    n_wins = len(profitable)
-    n_losses = len(losing)
-    win_rate = n_wins / n_trades * 100
+        from nandi.backtest.stress_test import StressTester
+        stress_tester = StressTester()
 
-    avg_win = profitable["pnl"].mean() if n_wins > 0 else 0
-    avg_loss = losing["pnl"].mean() if n_losses > 0 else 0
-    gross_profit = profitable["pnl"].sum() if n_wins > 0 else 0
-    gross_loss = abs(losing["pnl"].sum()) if n_losses > 0 else 0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        # Need full date range for stress testing
+        for pair, result in pair_results.items():
+            if pair in pair_data and "test_dates" in pair_data[pair]:
+                dates = pair_data[pair]["test_dates"]
+                if len(dates) == len(result["daily_returns"]):
+                    logger.info(f"\n  {pair.upper()} Crisis Performance:")
+                    crises = stress_tester.test_all_crises(
+                        result["daily_returns"], dates
+                    )
+                    if not crises:
+                        logger.info("    (no crisis periods in test window)")
 
-    # Sharpe ratio (daily)
-    daily_returns = tdf["pnl"].values / INITIAL_BALANCE
-    sharpe = np.mean(daily_returns) / (np.std(daily_returns) + 1e-10) * np.sqrt(252)
+    # ── OOD Detection ──
+    if args.ood:
+        logger.info(f"\n{'─' * 60}")
+        logger.info("  OUT-OF-DISTRIBUTION DETECTION")
+        logger.info(f"{'─' * 60}")
 
-    # Annualized return
-    test_days = len(test_prices) - LOOKBACK_WINDOW
-    annual_return = ((equity / INITIAL_BALANCE) ** (252 / max(test_days, 1)) - 1) * 100
+        from nandi.backtest.ood_detector import OODDetector
+        ood = OODDetector()
 
-    logger.info(f"\n{'=' * 60}")
-    logger.info(f"  NANDI BACKTEST RESULTS — EURUSD (UNSEEN DATA)")
-    logger.info(f"{'=' * 60}")
-    logger.info(f"  Test period:      {test_dates[LOOKBACK_WINDOW].date()} → {test_dates[-1].date()}")
-    logger.info(f"  Start balance:    ${INITIAL_BALANCE:,.2f}")
-    logger.info(f"  End balance:      ${equity:,.2f}")
-    logger.info(f"{'─' * 60}")
-    logger.info(f"  Total trades:     {n_trades}")
-    logger.info(f"  Win / Loss:       {n_wins} / {n_losses}")
-    logger.info(f"  Win rate:         {win_rate:.1f}%")
-    logger.info(f"{'─' * 60}")
-    logger.info(f"  Total return:     {total_return:+.2f}%")
-    logger.info(f"  Annualized (est): {annual_return:+.1f}%")
-    logger.info(f"  Sharpe ratio:     {sharpe:.2f}")
-    logger.info(f"  Profit factor:    {profit_factor:.2f}")
-    logger.info(f"  Max drawdown:     {max_dd:.2f}%")
-    logger.info(f"{'─' * 60}")
-    logger.info(f"  Avg win:          ${avg_win:+,.2f}")
-    logger.info(f"  Avg loss:         ${avg_loss:+,.2f}")
-    logger.info(f"{'=' * 60}")
+        for pair in pair_results:
+            if pair not in pair_data:
+                continue
 
-    # Save trades
+            data = pair_data[pair]
+            # Fit on training data
+            ood.fit(data["train_features"])
+
+            # Score test data
+            scores = ood.batch_score(data["test_features"])
+            n_ood = int(np.sum(scores > ood.threshold))
+            pct_ood = n_ood / len(scores) * 100
+
+            logger.info(
+                f"  {pair.upper():>8s}: "
+                f"{n_ood}/{len(scores)} bars OOD ({pct_ood:.1f}%) | "
+                f"Mean score: {np.mean(scores):.2f} | "
+                f"Max score: {np.max(scores):.2f} | "
+                f"Threshold: {ood.threshold:.2f}"
+            )
+
+    # ── Save Results ──
     os.makedirs("data", exist_ok=True)
-    tdf.to_csv("data/nandi_backtest.csv", index=False)
-    logger.info(f"Trades saved to data/nandi_backtest.csv")
+
+    suffix = f"_{args.timeframe}" if args.timeframe != "D1" else ""
+    for pair, result in pair_results.items():
+        if result["trades"]:
+            tdf = pd.DataFrame(result["trades"])
+            tdf.to_csv(f"data/nandi_bt_{pair}{suffix}.csv", index=False)
+
+    if portfolio_daily_returns:
+        eq_df = pd.DataFrame({
+            "portfolio_equity": port_equity,
+        })
+        eq_df.to_csv(f"data/nandi_portfolio_equity{suffix}.csv", index=False)
+
+    logger.info(f"\nResults saved to data/")
+    logger.info(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
