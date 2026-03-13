@@ -94,7 +94,7 @@ TIMEFRAME_PROFILES = {
         "data_source": "m5_resample",  # resample from cached M5
         "max_hold_bars": 72,           # 3 days max hold
         "min_edge_bps": 5.0,           # higher edge threshold for H1
-        "trailing_stop_pct": 0.005,    # V6: 0.5% trailing stop (~50 bps, ~10x cost)
+        "trailing_stop_pct": 0.0,      # V6: disabled — 50 bps was too tight for H1, caused churn
     },
     "M1": {
         "lookback_bars": 120,
