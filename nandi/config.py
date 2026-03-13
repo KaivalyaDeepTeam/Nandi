@@ -56,6 +56,7 @@ TIMEFRAMES = {
     "H4": {"bars": 500, "mt5_tf": "H4"},
     "H1": {"bars": 500, "mt5_tf": "H1"},
     "M5": {"bars": 2016, "mt5_tf": "M5"},
+    "M1": {"bars": 10080, "mt5_tf": "M1"},
 }
 
 # ── Timeframe Profiles ───────────────────────────────────────────
@@ -72,15 +73,41 @@ TIMEFRAME_PROFILES = {
     },
     "M5": {
         "lookback_bars": 120,
-        "leverage": 5,
+        "leverage": 15,
         "episode_bars": 2016,
         "bars_per_session": 288,
-        "max_position": 0.3,
+        "max_position": 0.5,
         "feature_windows": {"returns": [1, 3, 6, 12, 36], "vol": [12, 36, 72, 288]},
         "spread_multiplier": 0.8,
         "data_source": "mt5",
         "max_hold_bars": 36,
         "min_edge_bps": 2.0,
+    },
+    "H1": {
+        "lookback_bars": 48,           # 48 H1 bars = 2 days of market history
+        "leverage": 10,                # moderate leverage for H1 swings
+        "episode_bars": 504,           # 504 H1 bars = ~3 weeks
+        "bars_per_session": 24,        # 24 H1 bars per day
+        "max_position": 0.75,          # 75% max position
+        "feature_windows": {"returns": [1, 2, 4, 8, 24], "vol": [4, 8, 24, 120]},
+        "spread_multiplier": 1.0,
+        "data_source": "m5_resample",  # resample from cached M5
+        "max_hold_bars": 72,           # 3 days max hold
+        "min_edge_bps": 5.0,           # higher edge threshold for H1
+        "trailing_stop_pct": 0.005,    # V6: 0.5% trailing stop (~50 bps, ~10x cost)
+    },
+    "M1": {
+        "lookback_bars": 120,
+        "leverage": 3,
+        "episode_bars": 1440,
+        "bars_per_session": 840,
+        "max_position": 0.2,
+        "feature_windows": {"returns": [1, 3, 5, 10, 30], "vol": [10, 30, 60, 240]},
+        "spread_multiplier": 1.0,
+        "cost_multiplier": 0.5,       # M1 trades are tiny/brief — full cost is unrealistic
+        "data_source": "histdata",
+        "max_hold_bars": 60,
+        "min_edge_bps": 1.5,
     },
 }
 
@@ -153,36 +180,51 @@ ENCODER_CONFIG = {
     "dropout": 0.15,
 }
 
-# ── PPO Agent ────────────────────────────────────────────────────────
+# ── PPO Agent (Discrete Actions) ─────────────────────────────────────
 PPO_CONFIG = {
-    "gamma": 0.99,
+    "gamma": 0.95,                  # short horizon for M5 scalping
     "lambda_gae": 0.95,
     "clip_ratio": 0.2,
-    "entropy_coef": 0.10,           # doubled: prevent entropy collapse
+    "entropy_coef": 0.03,           # prevent HOLD collapse without over-randomizing
     "value_coef": 0.5,
     "max_grad_norm": 0.5,
     "learning_rate": 3e-4,
-    "n_epochs": 10,
-    "batch_size": 64,
-    "rollout_length": 252,
-    "min_entropy": 0.5,             # entropy floor to maintain exploration
+    "n_epochs": 4,                  # PPO update epochs per rollout
+    "batch_size": 256,
+    "rollout_length": 2048,         # steps per rollout (across all envs)
+    "min_entropy": 0.2,             # adaptive entropy increase below this
+}
+
+# ── PPO H1 Overrides (longer horizon, less entropy needed) ───────────
+PPO_CONFIG_H1 = {
+    "gamma": 0.97,                  # longer horizon for H1 swings
+    "lambda_gae": 0.95,
+    "clip_ratio": 0.2,
+    "entropy_coef": 0.01,           # V6: low base, adaptive ramp prevents collapse
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "learning_rate": 3e-4,
+    "n_epochs": 4,
+    "batch_size": 256,
+    "rollout_length": 2048,
+    "min_entropy": 0.3,             # V6: raised from 0.15 to keep exploration alive
 }
 
 # ── AEGIS: Adaptive Edge-Gated Intelligent Scalper ──────────────────
 AEGIS_CONFIG = {
-    "cvar_alpha": 0.50,           # optimize worst 50% (less fearful, will actually trade)
+    "cvar_alpha": 0.35,           # less conservative — will actually trade
     "n_quantiles": 32,            # quantile resolution for return distribution
     "asymmetry_factor": 1.5,     # reduced from 2.0 — less pessimistic critic
     "regime_dim": 8,              # latent regime dimensions
-    "kl_coef": 0.01,              # regime VAE regularization weight
+    "kl_coef": 0.1,               # regime VAE regularization weight (raised to keep VAE alive)
     "edge_coef": 1.0,             # edge gate loss weight
     "edge_util_coef": 0.1,        # edge utilization bonus weight
     "batch_size": 256,
     "buffer_capacity": 200_000,
     "tau_soft": 0.005,            # Polyak averaging coefficient
     "gamma": 0.95,                # lower for M5 scalping (short horizons)
-    "learning_rate": 1e-4,        # slower LR for stability
-    "warmup_steps": 1000,
+    "learning_rate": 3e-4,        # faster learning
+    "warmup_steps": 5000,
 }
 
 # ── Training ─────────────────────────────────────────────────────────
@@ -267,3 +309,70 @@ def _find_mt5_dir():
     return _MT5_PATHS[0]
 
 MT5_FILES_DIR = _find_mt5_dir()
+
+# ── Pair Index Mapping (for pair embedding in multi-pair DQN) ────
+PAIR_TO_IDX = {pair: i for i, pair in enumerate(PAIRS)}
+
+# ── DQN: Discrete-Action Dueling IQN-DQN ────────────────────────
+DQN_CONFIG = {
+    # Action space
+    "n_actions": 4,               # HOLD=0, LONG=1, SHORT=2, CLOSE=3
+    # IQN
+    "n_tau": 8,                   # fewer quantiles → sharper Q-values (was 32, oversmoothed)
+    "cosine_dim": 64,             # cosine embedding dimension
+    "kappa": 1.0,                 # Huber loss threshold
+    # Architecture
+    "d_model": 128,               # encoder output dim (matches MSFAN)
+    "position_dim": 8,            # extended position info (V4: +unrealized_pnl, +mfe)
+    "pair_embed_dim": 16,         # pair embedding dimension
+    "trunk_hidden": 256,          # trunk first layer
+    "trunk_out": 128,             # trunk output / stream input
+    "stream_hidden": 64,          # value/advantage stream hidden
+    # NoisyNet
+    "noisy_sigma": 0.5,           # high sigma for exploration (was 0.1, too conservative)
+    # Training
+    "gamma": 0.95,                # discount (short horizon for M5)
+    "n_step": 3,                  # multi-step return
+    "lr": 5e-5,                   # gentle RL fine-tuning (preserve HOA features)
+    "batch_size": 256,
+    "buffer_capacity": 500_000,
+    "per_alpha": 0.6,             # PER priority exponent
+    "per_beta_start": 0.4,        # PER IS correction start
+    "per_beta_end": 1.0,          # PER IS correction end
+    "target_update_freq": 1000,   # hard target update interval
+    "warmup_steps": 10_000,       # fill buffer before training
+    "total_steps": 500_000,
+    # Risk hardening
+    "hardening_lr": 3e-5,
+    "hardening_steps": 50_000,
+    "adversarial_ratio": 0.3,     # 30% adversarial episodes
+}
+
+# ── HOA: Hindsight Optimal Action Pre-training ───────────────────
+HOA_CONFIG = {
+    "horizon": 36,                # look-ahead bars (3 hours at M5)
+    "cost_threshold_mult": 2.0,   # label LONG/SHORT only if best > 2x cost
+    "label_smoothing": 0.1,
+    "epochs": 10,
+    "batch_size": 512,
+    "lr": 1e-3,
+    # Success criteria
+    "min_hold_acc": 0.85,
+    "min_trade_acc": 0.40,
+    "min_weighted_acc": 0.60,
+}
+
+# ── HOA H1 Overrides (longer horizon, lower threshold) ──────────────
+HOA_CONFIG_H1 = {
+    "horizon": 48,                # look ahead 48 H1 bars (2 days)
+    "cost_threshold_mult": 1.5,   # for position-aware mode (DQN)
+    "flat_hold_pct": 0.60,        # for flat mode (PPO): 60% HOLD, 20% LONG, 20% SHORT
+    "label_smoothing": 0.1,
+    "epochs": 5,                    # V6: reduced from 10 — 76% acc is enough warm start
+    "batch_size": 512,               #      10 epochs → 91% → entropy collapses at PPO start
+    "lr": 1e-3,
+    # Success criteria
+    "min_hold_acc": 0.70,            # V6: relaxed from 0.80 (fewer epochs = lower acc)
+    "min_trade_acc": 0.35,
+    "min_weighted_acc": 0.55,
+}

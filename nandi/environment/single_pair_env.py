@@ -51,6 +51,7 @@ class ForexTradingEnv:
         self.max_position = self.profile["max_position"]
         self.bars_per_session = self.profile["bars_per_session"]
         self.max_hold_bars = self.profile.get("max_hold_bars", 0)
+        self.cost_multiplier = self.profile.get("cost_multiplier", 1.0)
 
         # Timeframe-specific risk limits: M5 gets tighter limits
         self.risk_limits = RISK_LIMITS_M5 if timeframe != "D1" else RISK_LIMITS
@@ -94,6 +95,9 @@ class ForexTradingEnv:
         # Risk: cooldown after session loss trigger
         self.cooldown_remaining = 0
 
+        # Last market return for counterfactual edge labeling
+        self.last_market_return = 0.0
+
         # Reset reward components
         if self.composite_reward is not None:
             self.composite_reward.reset()
@@ -133,6 +137,7 @@ class ForexTradingEnv:
 
         price_next = self.prices[self.current_idx]
         market_ret = (price_next - price_now) / price_now
+        self.last_market_return = market_ret
 
         # ── PnL from CURRENT position (before update) ──
         position_pnl = self.position * market_ret * self.equity * self.leverage
@@ -156,6 +161,7 @@ class ForexTradingEnv:
             ) * self.equity
         else:
             cost = position_change * self.equity * TRANSACTION_COST_BPS / 10000
+        cost *= self.cost_multiplier
         # Cap cost so pnl - cost doesn't exceed remaining budget
         if position_pnl - cost < -remaining_budget_dollars:
             cost = min(cost, max(0.0, remaining_budget_dollars + position_pnl))
@@ -300,6 +306,7 @@ class ForexTradingEnv:
             "return_pct": (self.equity / self.initial_balance - 1) * 100,
             "bars_in_trade": self.bars_in_trade,
             "timeframe": self.timeframe,
+            "market_return": self.last_market_return,
         }
 
 

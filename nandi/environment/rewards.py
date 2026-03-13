@@ -131,9 +131,9 @@ class ScalpingReward:
             reward -= 0.2 * overshoot
 
         # ── Flat-when-uncertain bonus ──
-        # +0.002 for staying flat when market is quiet
+        # +0.0005 for staying flat when market is quiet (4x weaker — doesn't dominate trading incentive)
         if abs(position) < 0.05 and abs(market_return) < 0.0005:
-            reward += 0.002
+            reward += 0.0005
 
         # ── Drawdown penalty ──
         dd_penalty = max(0.0, drawdown - 0.03) * 0.8  # tighter threshold for scalping

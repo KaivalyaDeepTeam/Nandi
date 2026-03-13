@@ -1,8 +1,8 @@
 """
-Nandi V2 — Multi-Asset Multi-Strategy Portfolio Trading System.
+Nandi V3 — Discrete-Action DQN Trading System.
 
-A reinforcement learning forex trading system using MSFAN architecture,
-extended to 8 pairs with portfolio-level risk management.
+RL forex scalping with Dueling IQN-DQN, HOA pre-training,
+and risk hardening across 8 pairs on M5 timeframe.
 """
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"

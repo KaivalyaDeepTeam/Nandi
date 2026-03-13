@@ -1,3 +1,3 @@
 from nandi.models.msfan import CausalConvBlock, MultiScaleEncoder
-from nandi.models.agent import NandiAgent
-from nandi.models.critic import CriticNetwork, TwinCritic
+from nandi.models.dqn_agent import NandiDQNAgent
+from nandi.models.ppo_agent import NandiPPOAgent

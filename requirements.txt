@@ -11,3 +11,4 @@ hmmlearn
 feedparser
 requests
 transformers
+histdata

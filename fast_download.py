@@ -27,6 +27,7 @@ logger = logging.getLogger("fast_download")
 
 PAIRS = ["eurusd", "gbpusd", "usdjpy", "audusd", "nzdusd", "usdchf", "usdcad", "eurjpy"]
 OUT_DIR = Path("data/nandi/m5")
+M1_DIR = Path("data/nandi/m1")
 YEARS = range(2019, 2027)  # 7 years
 
 # Typical spreads for major pairs
@@ -68,11 +69,12 @@ def download_pair(pair):
     from histdata.api import Platform, TimeFrame
 
     cache_path = OUT_DIR / f"{pair}_m5_7y.csv"
-    if cache_path.exists():
+    m1_cache = M1_DIR / f"{pair}_m1_7y.csv"
+    if cache_path.exists() and m1_cache.exists():
         try:
             df = pd.read_csv(cache_path, index_col=0, nrows=5)
             if len(df) > 0:
-                logger.info(f"[{pair.upper()}] Already cached ✓")
+                logger.info(f"[{pair.upper()}] Already cached (M5+M1) ✓")
                 return pair, True, "cached"
         except Exception:
             pass
@@ -106,6 +108,14 @@ def download_pair(pair):
     m1_df = pd.concat(all_m1).sort_index()
     m1_df = m1_df[~m1_df.index.duplicated(keep='first')]
 
+    # Save raw M1 data
+    M1_DIR.mkdir(parents=True, exist_ok=True)
+    m1_cache = M1_DIR / f"{pair}_m1_7y.csv"
+    m1_save = m1_df.copy()
+    m1_save["spread"] = SPREADS.get(pair, 0.00015)
+    m1_save.to_csv(m1_cache)
+    logger.info(f"[{pair.upper()}] Saved {len(m1_save):,} M1 bars to {m1_cache}")
+
     # Resample M1 → M5
     m5_df = m1_df.resample("5min").agg({
         "open": "first", "high": "max", "low": "min",
@@ -127,12 +137,13 @@ def main():
     pairs = [p.lower() for p in sys.argv[1:]] if len(sys.argv) > 1 else PAIRS
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Check existing
+    # Check existing (need both M5 and M1 caches)
     pending = []
     for pair in pairs:
         cache_path = OUT_DIR / f"{pair}_m5_7y.csv"
-        if cache_path.exists():
-            logger.info(f"[{pair.upper()}] Already cached ✓")
+        m1_cache = M1_DIR / f"{pair}_m1_7y.csv"
+        if cache_path.exists() and m1_cache.exists():
+            logger.info(f"[{pair.upper()}] Already cached (M5+M1) ✓")
         else:
             pending.append(pair)
 

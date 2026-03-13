@@ -90,10 +90,7 @@ class DataManager:
           Pass 2: Compute cross-pair lead-lag features, inject, THEN split+scale
         This ensures the agent sees what other pairs did before making a trade.
         """
-        if self.timeframe != "D1" and len(self.pairs) > 1:
-            return self._prepare_all_m5_with_cross_features()
-
-        # D1 or single-pair: original pipeline
+        # Per-pair pipeline (no cross-pair features)
         for pair in self.pairs:
             try:
                 self.pair_data[pair] = self.prepare_pair(pair)
@@ -102,7 +99,8 @@ class DataManager:
                 continue
 
         # Cross-pair features (D1 — same-bar correlations, DXY proxy)
-        if self.timeframe == "D1":
+        # Skip for single-pair training (no cross-pair signal needed)
+        if self.timeframe == "D1" and len(self.pairs) > 1:
             try:
                 from nandi.data.cross_features import compute_all_cross_features
                 closes_df = self.get_all_closes()
@@ -249,6 +247,8 @@ class DataManager:
         """Full pipeline for a single pair: data -> features -> normalize -> split."""
         if self.timeframe == "D1":
             return self._prepare_pair_d1(pair)
+        elif self.timeframe == "H1":
+            return self._prepare_pair_h1(pair)
         else:
             return self._prepare_pair_m5(pair)
 
@@ -279,17 +279,91 @@ class DataManager:
 
         return self._split_and_scale(pair, df, features)
 
+    def _prepare_pair_h1(self, pair):
+        """H1 pipeline: load cached M5 → resample to H1 → scalping features → split."""
+        from nandi.data.scalping_features import compute_scalping_features
+        from nandi.config import SCALPING_CONFIG
+
+        profile = TIMEFRAME_PROFILES["H1"]
+        df = None
+
+        # Load cached M5 data (same source as M5 pipeline)
+        m5_cache = os.path.join(DATA_DIR, "m5", f"{pair}_m5_7y.csv")
+        if os.path.exists(m5_cache):
+            try:
+                df = pd.read_csv(m5_cache, index_col=0, parse_dates=True)
+                if len(df) >= profile["lookback_bars"] * 2:
+                    logger.info(f"[{pair.upper()}] Loaded cached M5 data for H1 resample ({len(df):,} bars)")
+                else:
+                    df = None
+            except Exception as e:
+                logger.warning(f"[{pair.upper()}] M5 cache load failed: {e}")
+                df = None
+
+        # Fallback: synthetic M5 from daily
+        if df is None:
+            from nandi.data.mt5_data import generate_synthetic_m5
+            logger.info(f"[{pair.upper()}] No M5 cache — generating synthetic M5 from daily for H1")
+            daily_df = download_forex_data(symbol=pair, years=self.years)
+            df = generate_synthetic_m5(daily_df, pair_name=pair)
+
+        if df is None or len(df) == 0:
+            raise ValueError(f"No M5 data available for {pair} (H1 resample)")
+
+        # Apply session filter before resampling (keeps London+NY only)
+        if SCALPING_CONFIG.get("session_filter", True):
+            from nandi.data.mt5_data import filter_session_hours
+            df = filter_session_hours(df)
+
+        # Resample M5 → H1
+        h1 = df.resample("1h").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }).dropna()
+
+        logger.info(f"[{pair.upper()}] Resampled M5→H1: {len(h1):,} H1 bars")
+        self.raw_data[pair] = h1
+
+        # Compute scalping features using H1 profile windows
+        features = compute_scalping_features(h1, profile=profile)
+        features.dropna(inplace=True)
+        self.features[pair] = features
+
+        if len(features) < profile["lookback_bars"] * 2:
+            raise ValueError(
+                f"[{pair.upper()}] Insufficient H1 bars after features: {len(features)}"
+            )
+
+        return self._split_and_scale(pair, h1, features)
+
     def _prepare_pair_m5(self, pair):
-        """M5 pipeline: cached CSV -> MT5 bridge -> synthetic fallback -> scalping features -> split."""
+        """Intraday pipeline: cached CSV -> MT5 bridge -> synthetic fallback -> scalping features -> split."""
         from nandi.data.mt5_data import MT5DataFetcher, generate_synthetic_m5, filter_session_hours
         from nandi.data.scalping_features import compute_scalping_features
 
         profile = TIMEFRAME_PROFILES.get(self.timeframe, TIMEFRAME_PROFILES["M5"])
         df = None
 
+        # Priority 0: M1 cache (if timeframe is M1)
+        if self.timeframe == "M1":
+            m1_cache = os.path.join(DATA_DIR, "m1", f"{pair}_m1_7y.csv")
+            if os.path.exists(m1_cache):
+                try:
+                    df = pd.read_csv(m1_cache, index_col=0, parse_dates=True)
+                    if len(df) >= profile["lookback_bars"] * 2:
+                        logger.info(f"[{pair.upper()}] Loaded cached M1 data ({len(df):,} bars)")
+                    else:
+                        df = None
+                except Exception as e:
+                    logger.warning(f"[{pair.upper()}] M1 cache load failed: {e}")
+                    df = None
+
         # Priority 1: Cached M5 CSV (from HistData/fast_download.py)
         m5_cache = os.path.join(DATA_DIR, "m5", f"{pair}_m5_7y.csv")
-        if os.path.exists(m5_cache):
+        if df is None and os.path.exists(m5_cache):
             try:
                 df = pd.read_csv(m5_cache, index_col=0, parse_dates=True)
                 if len(df) >= profile["lookback_bars"] * 2:
@@ -336,6 +410,12 @@ class DataManager:
         # Train/test split by date
         if self.timeframe == "D1":
             test_start = features.index[-1] - pd.DateOffset(months=self.test_months)
+        elif self.timeframe == "H1":
+            # For H1: ~22 trading days/month × 24 bars/day
+            bars_per_session = TIMEFRAME_PROFILES["H1"]["bars_per_session"]
+            test_bars = int(self.test_months * 22 * bars_per_session)
+            test_bars = min(test_bars, len(features) // 4)  # max 25% test
+            test_start = features.index[-test_bars] if test_bars > 0 else features.index[-1]
         else:
             # For M5: test_months in bars (approximate)
             test_bars = int(self.test_months * 22 * 288)  # ~22 trading days/month * 288 bars/day
