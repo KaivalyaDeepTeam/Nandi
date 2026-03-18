@@ -33,7 +33,7 @@ from nandi.live.risk_manager import LiveRiskManager
 
 # ── Defaults ────────────────────────────────────────────────────
 DEFAULT_PAIRS = ["eurusd", "gbpusd", "audusd", "nzdusd", "usdchf", "usdcad"]
-DEFAULT_CHECKPOINT = "ppo_agent_best.pt"
+DEFAULT_CHECKPOINT = "spin_agent_phase2.pt"
 DEFAULT_LOT_SIZE = 0.01
 DEFAULT_INTERVAL = 10  # seconds
 
