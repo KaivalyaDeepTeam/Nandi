@@ -177,7 +177,7 @@ ENCODER_CONFIG = {
     "kernel_sizes": [3, 7, 15],
     "dilations": [1, 4, 16],
     "n_heads": 4,
-    "dropout": 0.15,
+    "dropout": 0.20,
 }
 
 # ── PPO Agent (Discrete Actions) ─────────────────────────────────────
@@ -281,6 +281,11 @@ LIVE_CONFIG = {
 
 # ── MT5 Bridge ───────────────────────────────────────────────────────
 _MT5_PATHS = [
+    # Linux Wine MT5 — FILE_COMMON path
+    os.path.expanduser(
+        "~/.mt5/drive_c/users/" + os.environ.get("USER", "user") +
+        "/AppData/Roaming/MetaQuotes/Terminal/Common/Files"
+    ),
     # FILE_COMMON path (NandiBridge EA default — most reliable)
     os.path.expanduser(
         "~/Library/Application Support/net.metaquotes.wine.metatrader5/"
@@ -368,11 +373,76 @@ HOA_CONFIG_H1 = {
     "cost_threshold_mult": 1.5,   # for position-aware mode (DQN)
     "flat_hold_pct": 0.60,        # for flat mode (PPO): 60% HOLD, 20% LONG, 20% SHORT
     "label_smoothing": 0.1,
-    "epochs": 5,                    # V6: reduced from 10 — 76% acc is enough warm start
-    "batch_size": 512,               #      10 epochs → 91% → entropy collapses at PPO start
+    "epochs": 8,                    # V6: 8 epochs — stronger warm start while preserving entropy
+    "batch_size": 512,
     "lr": 1e-3,
     # Success criteria
     "min_hold_acc": 0.70,            # V6: relaxed from 0.80 (fewer epochs = lower acc)
     "min_trade_acc": 0.35,
     "min_weighted_acc": 0.55,
+}
+
+# ── SPIN: Stochastic Path Intelligence Network (V7) ──────────────────
+SPIN_CONFIG = {
+    # Architecture
+    "n_features": 65,             # 36 scalping + 21 path sig + 8 HTF
+    "d_model": 48,                # compact latent dim (vs 128 MSFAN)
+    "lookback_bars": 120,         # M5 lookback
+    "position_dim": 12,           # enhanced position info
+    "position_embed_dim": 24,
+    "pair_embed_dim": 8,
+    "trunk_hidden": 128,
+    "trunk_out": 64,
+    # CausalConvEncoder
+    "conv_kernels": [3, 7, 3],
+    "conv_dilations": [1, 1, 4],
+    "conv_dropout": 0.10,
+    # RegimeGate
+    "regime_bottleneck": 16,
+    # Heads
+    "head_hidden": 32,
+    "n_entry_actions": 3,         # HOLD, LONG, SHORT
+    "n_exit_actions": 2,          # HOLD, CLOSE
+    "n_hoa_actions": 4,           # for HOA pre-training
+}
+
+SPIN_PPO_CONFIG = {
+    "gamma": 0.97,                # longer horizon for M5 SPIN
+    "lambda_gae": 0.95,
+    "clip_ratio": 0.2,
+    "entropy_coef": 0.05,         # higher to fight restrictive risk gate masking
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "learning_rate": 5e-4,
+    "n_epochs": 4,
+    "batch_size": 512,
+    "rollout_length": 4096,
+    "min_entropy": 0.20,          # higher floor — SPIN has fewer valid actions
+}
+
+SPIN_HOA_CONFIG = {
+    "horizon": 12,                # shorter: 12 M5 bars = 1 hour (matches max hold)
+    "cost_threshold_mult": 2.0,
+    "flat_hold_pct": 0.55,        # 55% HOLD, rest entries
+    "label_smoothing": 0.1,
+    "epochs": 12,
+    "batch_size": 1024,
+    "lr": 3e-3,
+    # Success criteria
+    "min_hold_acc": 0.70,
+    "min_trade_acc": 0.30,
+    "min_weighted_acc": 0.50,
+}
+
+# SPIN Risk Management — hard-wired environment constraints
+SPIN_RISK_CONFIG = {
+    "stop_loss_atr_mult": 1.5,    # SL at 1.5x ATR from entry
+    "max_hold_bars": 12,          # force close after 12 bars (1hr)
+    "cooldown_bars": 3,           # 3-bar cooldown after SL hit
+    "cooldown_consecutive": 6,    # 6-bar cooldown after 2 consecutive losses
+    "min_rr_ratio": 1.0,          # min reward:risk ratio at entry
+    "max_session_loss_pct": 1.5,  # -1.5% session loss → stop trading
+    "max_session_trades": 20,     # max 20 trades per session
+    "trend_filter": True,         # only LONG if H1 trend >= 0, SHORT if <= 0
+    "max_position": 0.3,          # fixed position size
 }

@@ -190,7 +190,7 @@ def main():
     print(f"  DETERMINISTIC (argmax — for comparison)")
     print(f"{'=' * 55}")
     eval_ppo(pair_data, pairs, profile, timeframe, agent, device,
-             deterministic=True, n_episodes=min(3, n_episodes))
+             deterministic=True, n_episodes=n_episodes)
 
 
 if __name__ == "__main__":

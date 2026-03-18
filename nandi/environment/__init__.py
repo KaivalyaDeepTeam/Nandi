@@ -1,2 +1,3 @@
 from nandi.environment.single_pair_env import ForexTradingEnv, MultiEpisodeEnv
 from nandi.environment.discrete_env import DiscreteActionEnv, MultiEpisodeDiscreteEnv
+from nandi.environment.spin_env import SPINTradingEnv, MultiEpisodeSPINEnv

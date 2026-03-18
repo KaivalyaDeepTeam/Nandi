@@ -58,7 +58,7 @@ def create_envs(pair_data, pairs, lookback, timeframe, episode_length,
         if is_eval:
             features = data["test_features"]
             prices = data["test_prices"]
-            ep_len = len(prices) - lookback - 2
+            ep_len = min(episode_length, len(prices) - lookback - 2)
             if ep_len < 10:
                 logger.warning(f"Skipping {pair} eval — insufficient test data")
                 continue
@@ -230,6 +230,18 @@ def main():
         )
         hoa_metrics = pretrainer.train()
         logger.info(f"HOA metrics: {hoa_metrics}")
+
+        # Initialize CLOSE bias to match HOLD bias after HOA.
+        # HOA never trains CLOSE (weight=0), leaving its logit near-zero.
+        # Without this, deterministic policy never CLOSEs (HOLD always wins
+        # in the binary mask). Setting CLOSE bias = HOLD bias gives RL
+        # a 50/50 starting point to learn proper exit timing.
+        if use_ppo:
+            last_layer = agent.actor_head[3]  # Linear(64, 4) — after Dropout
+            with torch.no_grad():
+                hold_bias = last_layer.bias.data[0].item()
+                last_layer.bias.data[3] = hold_bias  # CLOSE = HOLD
+                logger.info(f"CLOSE bias initialized to HOLD bias: {hold_bias:.4f}")
 
         # Save HOA checkpoint
         hoa_name = "ppo_agent_hoa.pt" if use_ppo else "dqn_agent_hoa.pt"

@@ -67,14 +67,17 @@ class NandiPPOAgent(nn.Module):
             nn.Linear(trunk_in, cfg["trunk_hidden"]),  # 176→256
             nn.GELU(),
             nn.LayerNorm(cfg["trunk_hidden"]),
+            nn.Dropout(0.15),
             nn.Linear(cfg["trunk_hidden"], cfg["trunk_out"]),  # 256→128
             nn.GELU(),
+            nn.Dropout(0.12),
         )
 
         # ── Actor head: logits for Categorical distribution ──
         self.actor_head = nn.Sequential(
             nn.Linear(cfg["trunk_out"], 64),
             nn.GELU(),
+            nn.Dropout(0.15),
             nn.Linear(64, self.n_actions),
         )
 
@@ -82,6 +85,7 @@ class NandiPPOAgent(nn.Module):
         self.critic_head = nn.Sequential(
             nn.Linear(cfg["trunk_out"], 64),
             nn.GELU(),
+            nn.Dropout(0.12),
             nn.Linear(64, 1),
         )
 

@@ -13,7 +13,7 @@ from sklearn.preprocessing import RobustScaler
 
 from nandi.config import (
     DATA_DIR, PAIRS, LOOKBACK_YEARS, TEST_MONTHS, LOOKBACK_WINDOW,
-    TIMEFRAME_PROFILES,
+    TIMEFRAME_PROFILES, SCALPING_CONFIG,
 )
 from nandi.data.features import compute_features
 from nandi.data.advanced_features import compute_advanced_features
@@ -249,6 +249,8 @@ class DataManager:
             return self._prepare_pair_d1(pair)
         elif self.timeframe == "H1":
             return self._prepare_pair_h1(pair)
+        elif self.timeframe == "M5_SPIN":
+            return self._prepare_pair_spin(pair)
         else:
             return self._prepare_pair_m5(pair)
 
@@ -401,6 +403,137 @@ class DataManager:
         self.features[pair] = features
 
         return self._split_and_scale(pair, df, features)
+
+    def _prepare_pair_spin(self, pair):
+        """SPIN pipeline: M5 data -> scalping features + path sigs + HTF context -> split.
+
+        Also produces atr_series and h1_trend_series for the SPIN environment
+        risk gates (stop-loss, trend filter).
+
+        Data priority:
+          1. MT5 export CSV  -> data/nandi/m5_mt5/{pair}_m5.csv  (UTC, real volume)
+          2. HistData cache  -> data/nandi/m5/{pair}_m5_7y.csv   (fallback)
+          3. MT5 bridge      -> fx_m5_{PAIR}.csv                 (live 5000 bars)
+          4. Synthetic       -> generated from daily             (last resort)
+        """
+        from nandi.data.mt5_data import MT5DataFetcher, generate_synthetic_m5, filter_session_hours
+        from nandi.data.scalping_features import compute_scalping_features
+        from nandi.data.path_signatures import compute_path_signatures
+        from nandi.data.htf_context import compute_htf_context, compute_h1_trend_series
+
+        profile = TIMEFRAME_PROFILES.get("M5", TIMEFRAME_PROFILES["M5"])
+        df = None
+
+        # Priority 1: MT5 export CSV (UTC timestamps, real tick_volume)
+        mt5_cache = os.path.join(DATA_DIR, "m5_mt5", f"{pair}_m5.csv")
+        if os.path.exists(mt5_cache):
+            try:
+                df = pd.read_csv(mt5_cache, index_col=0, parse_dates=True)
+                if len(df) >= profile["lookback_bars"] * 2:
+                    logger.info(f"[{pair.upper()}] Loaded MT5 export data ({len(df):,} bars)")
+                else:
+                    df = None
+            except Exception as e:
+                logger.warning(f"[{pair.upper()}] MT5 export load failed: {e}")
+                df = None
+
+        # Priority 2: HistData cached M5 CSV
+        if df is None:
+            m5_cache = os.path.join(DATA_DIR, "m5", f"{pair}_m5_7y.csv")
+            if os.path.exists(m5_cache):
+                try:
+                    df = pd.read_csv(m5_cache, index_col=0, parse_dates=True)
+                    if len(df) >= profile["lookback_bars"] * 2:
+                        logger.info(f"[{pair.upper()}] Loaded HistData M5 cache ({len(df):,} bars)")
+                    else:
+                        df = None
+                except Exception as e:
+                    logger.warning(f"[{pair.upper()}] HistData cache load failed: {e}")
+                    df = None
+
+        # Priority 3: MT5 file bridge (live 5000 bars)
+        if df is None:
+            fetcher = MT5DataFetcher()
+            df = fetcher.fetch(pair)
+
+        # Priority 4: Synthetic fallback
+        if df is None or len(df) < profile["lookback_bars"] * 2:
+            logger.info(f"[{pair.upper()}] No real M5 data — generating synthetic")
+            daily_df = download_forex_data(symbol=pair, years=self.years)
+            df = generate_synthetic_m5(daily_df, pair_name=pair)
+
+        if df is None or len(df) == 0:
+            raise ValueError(f"No M5 data available for {pair}")
+
+        self.raw_data[pair] = df
+
+        # Compute HTF context and H1 trend BEFORE session filter (need full data)
+        htf_features = compute_htf_context(df)
+        h1_trend_series = compute_h1_trend_series(df)
+
+        # Apply session filter
+        if SCALPING_CONFIG.get("session_filter", True):
+            df_filtered = filter_session_hours(df)
+        else:
+            df_filtered = df
+
+        # Compute scalping features (36 features)
+        scalp_features = compute_scalping_features(df_filtered, profile=profile)
+
+        # Compute path signatures (21 features) — on filtered data
+        sig_features = compute_path_signatures(df_filtered)
+
+        # Align all features to common index
+        common_idx = scalp_features.index.intersection(sig_features.index)
+        common_idx = common_idx.intersection(htf_features.index)
+
+        if len(common_idx) < profile["lookback_bars"] * 2:
+            raise ValueError(f"[{pair.upper()}] Insufficient bars after feature alignment: {len(common_idx)}")
+
+        # Combine: 36 scalping + 21 signatures + 8 HTF = 65 features
+        combined = scalp_features.loc[common_idx].join(
+            sig_features.loc[common_idx], how="left"
+        ).join(
+            htf_features.loc[common_idx], how="left"
+        )
+        combined.dropna(inplace=True)
+
+        if len(combined) < profile["lookback_bars"] * 2:
+            raise ValueError(f"[{pair.upper()}] Insufficient bars after dropna: {len(combined)}")
+
+        self.features[pair] = combined
+
+        # Compute ATR series for stop-loss (aligned to combined index)
+        tr = pd.concat([
+            df_filtered["high"] - df_filtered["low"],
+            (df_filtered["high"] - df_filtered["close"].shift()).abs(),
+            (df_filtered["low"] - df_filtered["close"].shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr_series = tr.rolling(14, min_periods=1).mean()
+        atr_aligned = atr_series.reindex(combined.index).ffill().fillna(0.001)
+
+        # H1 trend aligned
+        h1_trend_aligned = h1_trend_series.reindex(combined.index, method="ffill").fillna(0.0)
+
+        # Split and scale
+        result = self._split_and_scale(pair, df_filtered, combined)
+
+        # Add extra series for SPIN environment
+        train_mask = combined.index < result["test_dates"][0]
+        test_mask = combined.index >= result["test_dates"][0]
+
+        result["atr_train"] = atr_aligned[train_mask].values.astype(np.float32)
+        result["atr_test"] = atr_aligned[test_mask].values.astype(np.float32)
+        result["h1_trend_train"] = h1_trend_aligned[train_mask].values.astype(np.float32)
+        result["h1_trend_test"] = h1_trend_aligned[test_mask].values.astype(np.float32)
+
+        logger.info(
+            f"[{pair.upper()}] SPIN features: {combined.shape[1]} "
+            f"(scalp={len(scalp_features.columns)} + "
+            f"sig={len(sig_features.columns)} + "
+            f"htf={len(htf_features.columns)})"
+        )
+        return result
 
     def _split_and_scale(self, pair, df, features):
         """Common split + normalize logic for both D1 and M5."""

@@ -260,6 +260,149 @@ def compute_hoa_labels(prices, features, lookback, pair_name="unknown",
     return market_states, position_infos, labels, pair_indices
 
 
+def compute_spin_hoa_labels(prices, features, lookback, pair_name="unknown",
+                            horizon=12, cost_threshold_mult=2.0,
+                            flat_hold_pct=0.55,
+                            atr_series=None, h1_trend_series=None,
+                            risk_config=None, max_samples=30_000):
+    """Compute HOA labels for SPIN — stop-loss-aware labeling.
+
+    Memory-efficient: computes lightweight labels first, subsamples,
+    then builds the expensive market_state windows only for kept indices.
+
+    Unlike standard HOA which uses unconstrained future prices, SPIN HOA
+    simulates the actual risk gates: would a LONG/SHORT trade have been
+    profitable AFTER accounting for SL hit, max hold, trend filter?
+
+    Args:
+        prices: numpy array of close prices
+        features: (n_bars, n_features) pre-scaled features
+        lookback: int
+        pair_name: str
+        horizon: int, look-ahead bars
+        cost_threshold_mult: float
+        flat_hold_pct: float, target HOLD percentage
+        atr_series: (n_bars,) ATR values
+        h1_trend_series: (n_bars,) H1 trend direction
+        risk_config: SPIN_RISK_CONFIG override
+        max_samples: int, max samples to return (subsamples if more)
+
+    Returns:
+        market_states, position_infos, labels, pair_indices
+    """
+    from nandi.config import SPIN_RISK_CONFIG, SPIN_CONFIG
+
+    cfg_risk = risk_config or SPIN_RISK_CONFIG
+    pair_idx_val = PAIR_TO_IDX.get(pair_name, 0)
+    cost_return = TRANSACTION_COST_BPS / 10000.0
+    sl_mult = cfg_risk["stop_loss_atr_mult"]
+    max_hold = cfg_risk["max_hold_bars"]
+    position_dim = SPIN_CONFIG["position_dim"]
+
+    n_bars = len(prices)
+
+    if atr_series is None:
+        atr_series = np.ones(n_bars) * 0.001
+    if h1_trend_series is None:
+        h1_trend_series = np.zeros(n_bars)
+
+    # ── Pass 1: compute lightweight labels (just bar index + label) ──
+    bar_edges = []
+
+    for t in range(lookback, n_bars - horizon):
+        price_t = prices[t]
+        if price_t <= 0:
+            continue
+
+        atr_t = atr_series[t]
+        h1_trend_t = h1_trend_series[t]
+
+        future = prices[t + 1: t + 1 + min(horizon, max_hold)]
+        if len(future) < 2:
+            continue
+
+        # Simulate LONG trade with stop-loss
+        long_edge = 0.0
+        if h1_trend_t >= 0 or not cfg_risk.get("trend_filter", True):
+            sl_price = price_t - atr_t * sl_mult
+            long_pnl = -cost_return * 2
+            for k, p in enumerate(future):
+                if p <= sl_price:
+                    long_pnl = (sl_price - price_t) / price_t - cost_return * 2
+                    break
+                pnl = (p - price_t) / price_t - cost_return * 2
+                long_pnl = max(long_pnl, pnl)
+            long_edge = long_pnl
+
+        # Simulate SHORT trade with stop-loss
+        short_edge = 0.0
+        if h1_trend_t <= 0 or not cfg_risk.get("trend_filter", True):
+            sl_price = price_t + atr_t * sl_mult
+            short_pnl = -cost_return * 2
+            for k, p in enumerate(future):
+                if p >= sl_price:
+                    short_pnl = (price_t - sl_price) / price_t - cost_return * 2
+                    break
+                pnl = (price_t - p) / price_t - cost_return * 2
+                short_pnl = max(short_pnl, pnl)
+            short_edge = short_pnl
+
+        bar_edges.append((t, long_edge, short_edge))
+
+    if not bar_edges:
+        return (np.array([]).reshape(0, lookback, features.shape[1]),
+                np.zeros((0, position_dim), dtype=np.float32),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64))
+
+    # Percentile-based thresholding to assign labels
+    net_edges = np.array([abs(le - se) for _, le, se in bar_edges])
+    edge_threshold = np.percentile(net_edges, flat_hold_pct * 100)
+    logger.info(f"  {pair_name} SPIN-HOA edge threshold: {edge_threshold * 10000:.1f} bps "
+                f"(p{flat_hold_pct * 100:.0f})")
+
+    bar_indices = []
+    bar_labels = []
+    for t, long_edge, short_edge in bar_edges:
+        net_edge = abs(long_edge - short_edge)
+        label = HOLD
+        if net_edge > edge_threshold:
+            if long_edge > short_edge and long_edge > 0:
+                label = LONG
+            elif short_edge > long_edge and short_edge > 0:
+                label = SHORT
+        bar_indices.append(t)
+        bar_labels.append(label)
+
+    bar_indices = np.array(bar_indices)
+    bar_labels = np.array(bar_labels, dtype=np.int64)
+
+    total_before = len(bar_labels)
+    for action_name, action_id in [("HOLD", 0), ("LONG", 1), ("SHORT", 2)]:
+        count = np.sum(bar_labels == action_id)
+        pct = 100.0 * count / max(1, len(bar_labels))
+        logger.info(f"  {pair_name} SPIN-HOA {action_name}: {count:,} ({pct:.1f}%)")
+
+    # ── Pass 2: subsample if needed, THEN build market_state windows ──
+    if len(bar_indices) > max_samples:
+        keep = np.random.permutation(len(bar_indices))[:max_samples]
+        keep.sort()
+        bar_indices = bar_indices[keep]
+        bar_labels = bar_labels[keep]
+        logger.info(f"  {pair_name} subsampled: {max_samples:,} / {total_before:,}")
+
+    n_keep = len(bar_indices)
+    n_feat = features.shape[1]
+    market_states = np.empty((n_keep, lookback, n_feat), dtype=np.float32)
+    position_infos = np.zeros((n_keep, position_dim), dtype=np.float32)
+    pair_indices = np.full(n_keep, pair_idx_val, dtype=np.int64)
+
+    for i, t in enumerate(bar_indices):
+        market_states[i] = features[t - lookback: t]
+
+    return market_states, position_infos, bar_labels, pair_indices
+
+
 class HOADataset(Dataset):
     """Dataset of HOA-labeled transitions for supervised pre-training."""
 
